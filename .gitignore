@@ -1,0 +1,27 @@
+# VS Code
+
+.vscode/
+
+# Arduino build files
+
+build/
+out/
+
+# Compiled binaries
+
+*.bin
+*.elf
+*.hex
+*.map
+
+# OS garbage
+
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Архивы
+*.zip
+
+# logs
+rfid_test_log_*.txt
