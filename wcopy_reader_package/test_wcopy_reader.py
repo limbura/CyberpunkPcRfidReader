@@ -91,6 +91,23 @@ class ReaderTests(unittest.TestCase):
         self.assertEqual(len(d.sent), 5)
         self.assertTrue(d.closed)
 
+    def test_observed_empty_reader_6300(self):
+        d = FakeDevice()
+        # Тело взято из аппаратного теста пользователя; HID-обёртка синтетическая.
+        d.rx[4] = response(9, bytes.fromhex('D5 4B 63 00'))
+        with self.assertRaises(r.NoCardError) as ctx:
+            self.run_device(d)
+        self.assertEqual(ctx.exception.status, 0x6300)
+        self.assertEqual(ctx.exception.response, bytes.fromhex('63 00'))
+        self.assertEqual(len(d.sent), 5)
+        self.assertTrue(d.closed)
+
+    def test_6300_does_not_mean_absence_during_authentication(self):
+        d = FakeDevice()
+        d.rx[5] = response(11, bytes.fromhex('D5 41 63 00'))
+        with self.assertRaises(r.AuthenticationError):
+            self.run_device(d)
+
     def test_auth_failure(self):
         d = FakeDevice()
         d.rx[5] = response(11, bytes.fromhex('D5 41 14 90 00'))
@@ -164,7 +181,8 @@ class WatchTests(unittest.TestCase):
         return r.NoCardError('absent', stage='poll')
 
     def test_hold_remove_reapply(self):
-        ev = self.events([self.A, self.A, self.absent(), self.absent(), self.A])
+        absent = r.NoCardError("poll failed", stage="poll", status=0x6300, response=b"\x63\x00")
+        ev = self.events([self.A, self.A, absent, absent, self.A])
         self.assertEqual([e.number for e in ev], [1, 1])
 
     def test_single_missed_poll_does_not_duplicate(self):

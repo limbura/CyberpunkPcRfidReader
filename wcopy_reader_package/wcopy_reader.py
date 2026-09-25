@@ -15,7 +15,7 @@ import logging
 import threading
 import time
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 VID, PID = 0x2518, 0x6018
 BLOCK = 1
 KEY_A = b"\xff" * 6
@@ -246,6 +246,12 @@ class _Session:
         time.sleep(0.05)
         self.configure(bytes.fromhex("32 05 00 01 02"), "configure")
         body = self.pn(bytes.fromhex("4A 01 00"), "poll")
+        # Наблюдение на NSR109-HIDIC V806N: без карты тело ответа D5 4B = 63 00.
+        # Это firmware-specific трактовка результата поиска, не универсальный
+        # смысл статуса 6300. Возможен также неуспешный поиск при наличии карты.
+        if body == b"\x63\x00":
+            raise NoCardError("Карта не обнаружена или поиск не удался (статус 63 00)",
+                              stage="poll", status=0x6300, response=body)
         if body and body[0] == 0:
             _fixed_body(body, 1, "poll")
             raise NoCardError("Карта не обнаружена", stage="poll")
