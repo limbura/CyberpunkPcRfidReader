@@ -1,5 +1,8 @@
-"""Тест света/звука без доступа к памяти карты. Включён журнал HID-пакетов."""
+"""Этот скрипт просто отправляет разные команды индикации на считыватель чтобы выяснить как работает индикация. Включён журнал HID-пакетов."""
 import logging
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from wcopy_reader import RFIDError, _open_session
 
 

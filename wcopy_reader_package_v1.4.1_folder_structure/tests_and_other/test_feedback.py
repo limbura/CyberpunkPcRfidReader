@@ -1,3 +1,4 @@
+""" Автоматические тесты кода управления светодиодом и звуком. Используют имитацию считывателя """
 import threading
 import unittest
 from unittest.mock import patch
@@ -28,7 +29,7 @@ class FeedbackTests(unittest.TestCase):
                 with self.assertRaises(r.FeedbackError):
                     session.feedback('green', False)
 
-    def run_watch(self, sequence, fail=False):
+    def run_watch(self, sequence, fail=False, sound=True):
         stop = threading.Event()
         items = iter(sequence)
         def read(**kwargs):
@@ -48,7 +49,7 @@ class FeedbackTests(unittest.TestCase):
                 patch.object(r, 'set_reader_feedback') as feedback:
             if fail:
                 feedback.side_effect = r.FeedbackError('unsupported', stage='feedback')
-            events = list(r.watch_cards(stop=stop, feedback=True))
+            events = list(r.watch_cards(stop=stop, feedback=True, sound=sound))
         return events, feedback.call_args_list
 
     def test_beep_once_until_removal_and_different_uid(self):
@@ -70,6 +71,13 @@ class FeedbackTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     r.set_reader_feedback(**kwargs)
             hid.assert_not_called()
+
+    def test_no_beep_preserves_led_and_events(self):
+        absent = r.NoCardError('absent', stage='poll')
+        events, calls = self.run_watch([absent, self.A, self.A, self.B], sound=False)
+        self.assertEqual([e.number for e in events], [1, 2])
+        self.assertEqual([c.args[0] for c in calls], ['red', 'green', 'green', 'green'])
+        self.assertTrue(all(c.kwargs['beep'] is False for c in calls))
 
 
 if __name__ == '__main__':

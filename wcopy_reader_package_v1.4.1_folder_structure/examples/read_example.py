@@ -1,15 +1,26 @@
-"""Консольный пример: python example.py [--debug]."""
+"""Читает карту один раз. Ключ --debug показывает USB-пакеты. python examples/read_example.py [--debug]."""
+
 import argparse
 import logging
+
+import sys
+from pathlib import Path
+# Добавляем основную папку проекта в пути поиска модулей.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from wcopy_reader import (
     read_card_number, NoCardError, AuthenticationError, CardReadError,
-    ReaderNotFoundError, ReaderOpenError, ReaderTimeoutError, USBError, RFIDError,
+    ReaderNotFoundError, ReaderOpenError, ReaderTimeoutError, USBError, RFIDError, set_led, beep,
 )
+
+# Индикация после успешного чтения. None отключает команду LED.
+SUCCESS_LED = "green"
+SUCCESS_BEEP = False  # прошивка может пищать сама при командах LED
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--debug", action="store_true", help="показывать USB-пакеты")
+    parser.add_argument("--no-feedback", action="store_true", help="не отправлять команды индикации")
     args = parser.parse_args()
     if args.debug:
         logging.basicConfig(level=logging.DEBUG, format="%(levelname)s %(message)s")
@@ -36,6 +47,17 @@ def main():
         print(f"{exc.code}, этап {exc.stage}: {exc}")
     else:
         print(f"Число на карте: {number}")
+        if not args.no_feedback:
+            actions = []
+            if SUCCESS_LED is not None:
+                actions.append(("светодиод", lambda: set_led(SUCCESS_LED)))
+            if SUCCESS_BEEP:
+                actions.append(("звук", beep))
+            for label, action in actions:
+                try:
+                    action()
+                except RFIDError as error:
+                    print(f"Карта прочитана, но не удалось включить {label}: {error.code}: {error}")
         return 0
     return 1
 

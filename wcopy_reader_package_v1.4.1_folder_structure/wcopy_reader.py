@@ -16,7 +16,7 @@ import logging
 import threading
 import time
 
-__version__ = "1.2.1"
+__version__ = "1.4.1"
 VID, PID = 0x2518, 0x6018
 BLOCK = 1
 KEY_A = b"\xff" * 6
@@ -267,11 +267,18 @@ class _Session:
     def feedback(self, color: str, beep: bool) -> tuple[bytes, ...]:
         replies = []
         if beep:
-            # Та же команда, которую формирует nfcPro_x64: FF 00 40 50 04 T 01 01 01.
-            replies.append(self.feedback_command(bytes.fromhex("FF 00 40 50 04 01 01 01 01")))
-        control = {"off": 0x0C, "red": 0x0D, "green": 0x0E}[color]
-        replies.append(self.feedback_command(bytes([0xFF, 0, 0x40, control, 4, 0, 0, 0, 0])))
+            replies.append(self.beep())
+        replies.append(self.set_led(color))
         return tuple(replies)
+
+    def beep(self) -> bytes:
+        # Та же команда, которую формирует nfcPro_x64: FF 00 40 50 04 T 01 01 01.
+        # Это аппаратный импульс: он также может временно влиять на LED.
+        return self.feedback_command(bytes.fromhex("FF 00 40 50 04 01 01 01 01"))
+
+    def set_led(self, color: str) -> bytes:
+        control = {"off": 0x0C, "red": 0x0D, "green": 0x0E}[color]
+        return self.feedback_command(bytes([0xFF, 0, 0x40, control, 4, 0, 0, 0, 0]))
 
     def read(self) -> CardData:
         self.initialize()
@@ -427,6 +434,41 @@ def write_card_number(number: int, *, path: bytes | None = None,
             offset=offset, length=length, byteorder=byteorder)
 
 
+def set_led(color: str, *, path: bytes | None = None, timeout_ms: int = 2500,
+            initialize: bool = False) -> bytes:
+    """Послать только команду LED: red/green/off. Вернуть сырой ответ.
+
+    Не посылает отдельной команды писка, но прошивка может издать звук сама.
+    Ответ устройства не подтверждает физический цвет. initialize=True —
+    INIT перед самостоятельным вызовом; после read/write он не требуется.
+    Не читает и не записывает память карты.
+    """
+    if color not in ("red", "green", "off"):
+        raise ValueError("color должен быть red, green или off")
+    if type(initialize) is not bool:
+        raise ValueError("initialize должен быть bool")
+    with _open_session(path, timeout_ms) as session:
+        if initialize:
+            session.initialize()
+        return session.set_led(color)
+
+
+def beep(*, path: bytes | None = None, timeout_ms: int = 2500,
+         initialize: bool = False) -> bytes:
+    """Послать один импульс командой из nfcPro; вернуть сырой ответ.
+
+    После read/write initialize не требуется. Реальная длительность и влияние
+    на светодиод зависят от прошивки. Не гарантирует независимость звука от LED.
+    Не посылает дополнительной команды установки цвета и не обращается к карте.
+    """
+    if type(initialize) is not bool:
+        raise ValueError("initialize должен быть bool")
+    with _open_session(path, timeout_ms) as session:
+        if initialize:
+            session.initialize()
+        return session.beep()
+
+
 def set_reader_feedback(color: str, *, beep: bool = False, path: bytes | None = None,
                         timeout_ms: int = 2500, initialize: bool = False) -> tuple[bytes, ...]:
     """Управлять индикатором/пищалкой устройства (аппаратная проверка требуется).
@@ -466,10 +508,23 @@ class CardError:
     error: RFIDError
 
 
+@dataclass(frozen=True)
+class CardState:
+    """Состояние после каждого успешного опроса или ответа «нет карты».
+
+    present учитывает removal_checks. is_new=True только при новом успешном
+    чтении; затем отдельно выдаётся CardPresented с данными. Ошибки USB и
+    авторизации не превращаются в CardState(False). Включается report_state=True.
+    """
+    present: bool
+    is_new: bool = False
+
+
 def watch_cards(*, stop: threading.Event | None = None,
                 interval: float = 0.25, removal_checks: int = 2,
                 path: bytes | None = None, timeout_ms: int = 2500,
-                feedback: bool = False, sound: bool = True) -> Iterator[CardPresented | CardError]:
+                feedback: bool = False, sound: bool = True,
+                report_state: bool = False) -> Iterator[CardPresented | CardError | CardState]:
     """Блокирующий генератор CardPresented / CardError; см. README.
 
     Событие карты — только после успешного чтения. Повторы одного UID подавляются
@@ -482,6 +537,9 @@ def watch_cards(*, stop: threading.Event | None = None,
     генератора; чтение продолжается. Удерживаемая карта повторно не пищит.
     sound=False отключает только нашу команду писка, сохраняя команды LED.
     На самостоятельные звуки прошивки этот параметр не влияет.
+    report_state=True добавляет CardState на каждом опросе для индикации
+    в приложении. По умолчанию команд LED/звука нет. feedback/sound сохранены
+    для совместимости; новым приложениям лучше вызывать set_led/beep самим.
     """
     import math
     if not isinstance(interval, (int, float)) or not math.isfinite(interval) or interval <= 0:
@@ -496,6 +554,8 @@ def watch_cards(*, stop: threading.Event | None = None,
         raise ValueError("feedback должен быть bool")
     if type(sound) is not bool:
         raise ValueError("sound должен быть bool")
+    if type(report_state) is not bool:
+        raise ValueError("report_state должен быть bool")
     stop = stop if stop is not None else threading.Event()
     last_uid = None
     absent = 0
@@ -526,6 +586,8 @@ def watch_cards(*, stop: threading.Event | None = None,
             if absent >= removal_checks:
                 last_uid = None
             warning = update_feedback("green" if last_uid is not None else "red")
+            if report_state:
+                yield CardState(last_uid is not None)
             if warning is not None:
                 yield warning
         except RFIDError as error:
@@ -541,6 +603,8 @@ def watch_cards(*, stop: threading.Event | None = None,
             last_error = None
             is_new = card.uid != last_uid
             warning = update_feedback("green", beep=is_new and sound)
+            if report_state:
+                yield CardState(True, is_new)
             if is_new:
                 last_uid = card.uid
                 yield CardPresented(card)
