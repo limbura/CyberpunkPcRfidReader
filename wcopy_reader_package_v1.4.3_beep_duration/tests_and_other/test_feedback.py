@@ -15,7 +15,7 @@ class FeedbackTests(unittest.TestCase):
         with patch.object(session, 'exchange', side_effect=[b'\x90\x02', b'\x90\x02']) as exchange:
             session.feedback('green', True)
         self.assertEqual([c.args[0] for c in exchange.call_args_list], [
-            bytes.fromhex('FF 00 40 50 04 01 01 01 01'),
+            bytes.fromhex('FF 00 40 50 04 05 01 01 01'),
             bytes.fromhex('FF 00 40 0E 04 00 00 00 00')])
         for color, mask in [('red', 0x0D), ('off', 0x0C)]:
             with patch.object(session, 'exchange', return_value=b'\0') as exchange:

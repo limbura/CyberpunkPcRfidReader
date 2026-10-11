@@ -16,7 +16,7 @@ import logging
 import threading
 import time
 
-__version__ = "1.4.1"
+__version__ = "1.4.3"
 VID, PID = 0x2518, 0x6018
 BLOCK = 1
 KEY_A = b"\xff" * 6
@@ -257,8 +257,8 @@ class _Session:
 
     def feedback_command(self, payload: bytes) -> bytes:
         body = self.exchange(payload, "feedback")
-        # ACS-compatible ответ содержит состояние LED, а не PN-префикс D5.
-        # Для vendor-реализаций допускается также однобайтовый статус 00.
+        # На проверенном wCopy ответ 90 01 не отражает реальный цвет LED.
+        # Принимаем известные формы ответа, но не трактуем их как физическое состояние.
         if body == b"\0" or (len(body) == 2 and body[0] == 0x90 and body[1] <= 3):
             return body
         raise FeedbackError("Считыватель не подтвердил команду света/звука: " + body.hex(" "),
@@ -271,10 +271,11 @@ class _Session:
         replies.append(self.set_led(color))
         return tuple(replies)
 
-    def beep(self) -> bytes:
+    def beep(self, t: int = 5) -> bytes:
         # Та же команда, которую формирует nfcPro_x64: FF 00 40 50 04 T 01 01 01.
-        # Это аппаратный импульс: он также может временно влиять на LED.
-        return self.feedback_command(bytes.fromhex("FF 00 40 50 04 01 01 01 01"))
+        # T — значение поля команды, не миллисекунды. Цвет этим вызовом не задаём.
+        _validate_beep_t(t)
+        return self.feedback_command(bytes.fromhex("FF 00 40 50 04") + bytes([t, 1, 1, 1]))
 
     def set_led(self, color: str) -> bytes:
         control = {"off": 0x0C, "red": 0x0D, "green": 0x0E}[color]
@@ -436,12 +437,17 @@ def write_card_number(number: int, *, path: bytes | None = None,
 
 def set_led(color: str, *, path: bytes | None = None, timeout_ms: int = 2500,
             initialize: bool = False) -> bytes:
-    """Послать только команду LED: red/green/off. Вернуть сырой ответ.
+    """Послать команду индикации red/green/off; вернуть сырой ответ.
 
-    Не посылает отдельной команды писка, но прошивка может издать звук сама.
-    Ответ устройства не подтверждает физический цвет. initialize=True —
-    INIT перед самостоятельным вызовом; после read/write он не требуется.
-    Не читает и не записывает память карты.
+    На NSR109-HIDIC V806N прямое задание цвета этими масками не подтверждено:
+    red/green/off ведут себя одинаково. Однако вызов после КАЖДОГО опроса,
+    включая «нет карты», нужен в проверенной схеме для штатного красного/
+    зелёного LED и писка прошивки. Сохраняйте вызовы, как в watch_example.
+    off также не гарантирует выключение LED. Ответ 90 01 не доказывает цвет.
+    Самостоятельный вызов после записи не дал видимого переключения.
+    Отдельной команды писка здесь нет; штатный звук может возникнуть сам.
+    initialize=True добавляет INIT перед командой; обычно после read/write
+    используется False. Память карты не читается и не записывается.
     """
     if color not in ("red", "green", "off"):
         raise ValueError("color должен быть red, green или off")
@@ -453,27 +459,38 @@ def set_led(color: str, *, path: bytes | None = None, timeout_ms: int = 2500,
         return session.set_led(color)
 
 
-def beep(*, path: bytes | None = None, timeout_ms: int = 2500,
-         initialize: bool = False) -> bytes:
-    """Послать один импульс командой из nfcPro; вернуть сырой ответ.
+def _validate_beep_t(t: int) -> None:
+    if type(t) is not int or not 1 <= t <= 255:
+        raise ValueError("t должен быть целым числом от 1 до 255 (поле T, не миллисекунды)")
 
-    После read/write initialize не требуется. Реальная длительность и влияние
-    на светодиод зависят от прошивки. Не гарантирует независимость звука от LED.
-    Не посылает дополнительной команды установки цвета и не обращается к карте.
+
+def beep(*, t: int = 5, path: bytes | None = None, timeout_ms: int = 2500,
+         initialize: bool = False) -> bytes:
+    """Подать один сигнал командой nfcPro; вернуть сырой ответ.
+
+    t — сырое поле T (целое 1..255), НЕ миллисекунды. По умолчанию 5,
+    как в обычных вызовах nfcPro. Аппаратно проверены T=1,3,5,10; увеличение
+    удлиняет писк. T=10 используется в write_example после проверки записи.
+    Для больших T может потребоваться увеличить timeout_ms (например, 5000).
+    Недопустимое t вызывает ValueError до обращения к USB.
+    initialize=True выполняет INIT; после read/write он обычно не требуется.
+    Не посылает команду установки цвета и не обращается к памяти карты.
     """
+    _validate_beep_t(t)
     if type(initialize) is not bool:
         raise ValueError("initialize должен быть bool")
     with _open_session(path, timeout_ms) as session:
         if initialize:
             session.initialize()
-        return session.beep()
+        return session.beep(t)
 
 
 def set_reader_feedback(color: str, *, beep: bool = False, path: bytes | None = None,
                         timeout_ms: int = 2500, initialize: bool = False) -> tuple[bytes, ...]:
-    """Управлять индикатором/пищалкой устройства (аппаратная проверка требуется).
+    """Совместимый комбинированный вызов команд индикации.
 
-    color: red/green/off. beep: один сигнал командой из nfcPro.
+    color: red/green/off с ограничениями set_led (прямой цвет не подтверждён).
+    beep=True: один сигнал с T=5. Для выбора T используйте отдельный beep(t=...).
     Возвращает ответы устройства: подтверждение команды не доказывает цвет/звук.
     initialize=True для самостоятельного теста, False после чтения в watch.
     Не отправляет команд чтения/записи памяти карты.
@@ -532,7 +549,7 @@ def watch_cards(*, stop: threading.Event | None = None,
     USB-сбой, тайм-аут и ошибка ключа НЕ считаются снятием карты.
     stop.set() завершает цикл после текущей операции. Запускать в рабочем потоке.
     Исключения вызывающего кода не перехватываются.
-    feedback=True: экспериментальное управление LED и звуком самого считывателя.
+    feedback=True: команды для штатной индикации прошивки (не прямого цвета).
     Ошибка индикации выдаётся отдельно и отключает индикацию до перезапуска
     генератора; чтение продолжается. Удерживаемая карта повторно не пищит.
     sound=False отключает только нашу команду писка, сохраняя команды LED.

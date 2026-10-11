@@ -23,7 +23,36 @@ class IndicationAPITests(unittest.TestCase):
             exchange.reset_mock()
             self.assertEqual(r.beep(), b'\x90\x01')
             self.assertEqual([c.args[0] for c in exchange.call_args_list],
-                             [bytes.fromhex('FF 00 40 50 04 01 01 01 01')])
+                             [bytes.fromhex('FF 00 40 50 04 05 01 01 01')])
+
+    def test_beep_duration_forwarded_with_initialize_and_response(self):
+        session = r._Session(None, 5000)
+        @contextmanager
+        def opened(*args):
+            yield session
+        with patch.object(r, '_open_session', opened), \
+                patch.object(session, 'exchange', return_value=b'\x90\x01') as exchange, \
+                patch.object(session, 'initialize') as initialize:
+            for t in (1, 3, 5, 10, 255):
+                with self.subTest(t=t):
+                    exchange.reset_mock()
+                    self.assertEqual(r.beep(t=t, initialize=True, timeout_ms=5000), b'\x90\x01')
+                    exchange.assert_called_once_with(bytes([255, 0, 64, 80, 4, t, 1, 1, 1]), 'feedback')
+            self.assertEqual(initialize.call_count, 5)
+
+    def test_invalid_beep_duration_never_opens_usb(self):
+        with patch.object(r, '_open_session') as opened:
+            for t in (0, -1, 256, True, False, 5.0, '5', None):
+                with self.subTest(t=t), self.assertRaises(ValueError):
+                    r.beep(t=t)
+            opened.assert_not_called()
+
+    def test_write_flags_suppress_beep_after_success(self):
+        for flag in ('--no-beep', '--no-feedback'):
+            with self.subTest(flag=flag):
+                status, order, _ = self.run_write(args=(flag,))
+                self.assertEqual(status, 0)
+                self.assertEqual(order, ['verified_write'])
 
     def test_state_reporting_does_not_send_indication(self):
         stop = threading.Event()
@@ -51,18 +80,19 @@ class IndicationAPITests(unittest.TestCase):
         led.assert_not_called()
         beep.assert_not_called()
 
-    def run_write(self, failure=None, beep_failure=None):
+    def run_write(self, failure=None, beep_failure=None, args=()):
         order = []
         def write(number):
             order.append('verified_write')
             if failure:
                 raise failure
             return number
-        def beep():
+        def beep(*, t):
+            self.assertEqual(t, 10)
             order.append('beep')
             if beep_failure:
                 raise beep_failure
-        with patch('sys.argv', ['write_example.py', '555']), patch('builtins.input', return_value=''), \
+        with patch('sys.argv', ['write_example.py', '555', *args]), patch('builtins.input', return_value=''), \
                 patch.object(examples.write_example, 'write_card_number', side_effect=write), \
                 patch.object(examples.write_example, 'beep', side_effect=beep), \
                 patch.object(examples.write_example, 'set_led') as led, redirect_stdout(io.StringIO()) as output:

@@ -8,6 +8,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from wcopy_reader import watch_cards, CardPresented, CardState, RFIDError, set_led, beep
 
 # Все решения об индикации находятся здесь, в приложении.
+# Не отключайте эти команды, если нужна штатная индикация при опросе.
+# На проверенной прошивке red/green/off не задают цвет напрямую, но вызовы
+# после каждого опроса позволяют работать автоматическому цвету и писку.
 USE_LED = True
 IDLE_LED = "red"
 PRESENT_LED = "green"
@@ -20,7 +23,7 @@ def main():
     parser.add_argument('--log-file', metavar='PATH', help='Записать подробный UTF-8 журнал прямо в файл')
     parser.add_argument('--no-beep', action='store_true', help='Отключить только нашу команду писка, сохранив LED')
     parser.add_argument('--beep', action='store_true', help='Дополнительная команда писка при новом чтении')
-    parser.add_argument('--no-feedback', action='store_true', help='Прежний режим без команд LED/звука')
+    parser.add_argument('--no-feedback', action='store_true', help='Не отправлять команды индикации; штатные LED/звук при опросе могут перестать работать')
     args = parser.parse_args()
     if args.beep and args.no_beep:
         parser.error('--beep и --no-beep нельзя использовать вместе')

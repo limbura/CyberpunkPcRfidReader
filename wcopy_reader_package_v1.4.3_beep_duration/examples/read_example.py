@@ -12,9 +12,10 @@ from wcopy_reader import (
     ReaderNotFoundError, ReaderOpenError, ReaderTimeoutError, USBError, RFIDError, set_led, beep,
 )
 
-# Индикация после успешного чтения. None отключает команду LED.
+# Команда индикации после чтения. Прямое задание цвета не подтверждено.
+# None отключает команду LED.
 SUCCESS_LED = "green"
-SUCCESS_BEEP = False  # прошивка может пищать сама при командах LED
+SUCCESS_BEEP = False  # оставляем штатный звук прошивки
 
 
 def main():

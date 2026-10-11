@@ -1,6 +1,7 @@
 """Записывает карту с проверкой записи последующим чтением: python write_example.py [ID] [--debug]."""
 import argparse
 import logging
+
 import sys
 from pathlib import Path
 # Добавляем основную папку проекта в пути поиска модулей.
@@ -8,10 +9,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from wcopy_reader import RFIDError, write_card_number, set_led, beep
 
 # Индикацией управляет этот пример, а не write_card_number().
-# Цвет: None (не менять), "red", "green", "off".
-# LED сам может вызывать звук, поэтому по умолчанию после записи только beep().
+# Команда LED: None (не отправлять), "red", "green", "off".
+# Прямое управление цветом не подтверждено. После записи — отдельный beep().
 SUCCESS_LED = None
 SUCCESS_BEEP = True
+SUCCESS_BEEP_T = 10  # поле T команды; не миллисекунды
 
 
 def main():
@@ -50,7 +52,7 @@ def main():
         if SUCCESS_LED is not None:
             actions.append(("светодиод", lambda: set_led(SUCCESS_LED)))
         if SUCCESS_BEEP and not args.no_beep:
-            actions.append(("звук", beep))
+            actions.append(("звук", lambda: beep(t=SUCCESS_BEEP_T)))
         for label, action in actions:
             try:
                 action()
