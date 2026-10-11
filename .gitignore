@@ -25,3 +25,10 @@ desktop.ini
 
 # logs
 rfid_test_log_*.txt
+
+# Виртуальные окружения Python
+.venv/
+
+# Кэш Python
+__pycache__/
+*.py[cod]
