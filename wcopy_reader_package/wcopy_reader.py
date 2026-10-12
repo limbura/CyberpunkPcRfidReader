@@ -16,7 +16,7 @@ import logging
 import threading
 import time
 
-__version__ = "1.4.3"
+__version__ = "1.4.4"
 VID, PID = 0x2518, 0x6018
 BLOCK = 1
 KEY_A = b"\xff" * 6
@@ -326,8 +326,14 @@ class _Session:
         return _fixed_body(body, size + 1, stage)[1:]
 
 
-    def write_number(self, encoded: bytes, offset: int) -> CardData:
+    def write_number(self, encoded: bytes, offset: int, *, expected_uid=None, expected_block=None) -> CardData:
         before = self.read()
+        if expected_uid is not None and before.uid != expected_uid:
+            raise VerificationError("Карта заменена до записи; UID не совпал. Запись не выполнялась.",
+                                    stage="prewrite", response=before.uid)
+        if expected_block is not None and before.block != expected_block:
+            raise VerificationError("Содержимое карты изменилось до записи. Запись не выполнялась.",
+                                    stage="prewrite", response=before.block)
         expected = before.block[:offset] + encoded + before.block[offset + len(encoded):]
         # PN InDataExchange / MIFARE Write: один блок целиком, 16 байт.
         # Не повторяем запись автоматически при тайм-ауте/сбое.
@@ -416,7 +422,9 @@ def read_card_number(*, path: bytes | None = None, timeout_ms: int = 2500,
 
 def write_card_number(number: int, *, path: bytes | None = None,
                       timeout_ms: int = 2500, offset: int = 8,
-                      length: int = 8, byteorder: str = "big") -> int:
+                      length: int = 8, byteorder: str = "big",
+                      expected_uid: bytes | None = None,
+                      expected_block: bytes | None = None) -> int:
     """Записать ID в блок 1 ключом A=FF…FF и обязательно проверить чтением.
 
     По умолчанию меняются байты 8..15 (uint64 big-endian); остальные сохраняются.
@@ -425,13 +433,20 @@ def write_card_number(number: int, *, path: bytes | None = None,
     RFIDError означает, что успех НЕ подтверждён; после команды write данные
     уже могли измениться. Автоматических повторов записи нет.
     Формат и диапазон проверяются до обращения к оборудованию.
+    expected_uid / expected_block: при передаче сравниваются с начальным чтением
+    в том же сеансе ДО команды записи. Несовпадение: VerificationError(stage="prewrite").
     """
     _validate_format(offset, length, byteorder)
     if type(number) is not int or not 0 <= number < (1 << (8 * length)):
         raise ValueError(f"number должен быть целым числом от 0 до {(1 << (8 * length)) - 1}")
+    if expected_uid is not None and (not isinstance(expected_uid, bytes) or len(expected_uid) not in (4, 7)):
+        raise ValueError("expected_uid должен быть bytes длиной 4 или 7 либо None")
+    if expected_block is not None and (not isinstance(expected_block, bytes) or len(expected_block) != 16):
+        raise ValueError("expected_block должен быть bytes длиной 16 либо None")
     encoded = number.to_bytes(length, byteorder, signed=False)
     with _open_session(path, timeout_ms) as session:
-        return session.write_number(encoded, offset).to_int(
+        return session.write_number(encoded, offset, expected_uid=expected_uid,
+                                    expected_block=expected_block).to_int(
             offset=offset, length=length, byteorder=byteorder)
 
 

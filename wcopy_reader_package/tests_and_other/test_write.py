@@ -54,6 +54,30 @@ class WriteDevice:
 
 
 class WriteTests(unittest.TestCase):
+    def test_expected_identity_mismatch_prevents_write_command(self):
+        for guard in ({'expected_uid': b'abcd'}, {'expected_block': b'\xff'*16}):
+            d = WriteDevice(b'\0'*16, b'\0'*15+b'\x01')
+            with self.subTest(guard=guard), self.assertRaises(r.VerificationError) as caught:
+                self.run_write(d, 1, **guard)
+            self.assertEqual(caught.exception.stage, 'prewrite')
+            self.assertEqual(len(d.sent), 7)  # Только исходное чтение, команды A0 нет.
+            self.assertTrue(d.closed)
+
+    def test_expected_identity_matches_and_verifies_full_block(self):
+        old = bytes(range(16))
+        d = WriteDevice(old, old[:8] + (555).to_bytes(8, 'big'))
+        self.assertEqual(self.run_write(d, 555, expected_uid=bytes.fromhex('C3D7C833'), expected_block=old), 555)
+        self.assertEqual(len(d.sent), 15)
+
+    def test_invalid_guards_never_open_usb(self):
+        with patch.object(r, '_get_hid') as hid:
+            for kwargs in ({'expected_uid': b''}, {'expected_uid': 'abcd'},
+                           {'expected_uid': b'abc'}, {'expected_block': b'\0'*15},
+                           {'expected_block': bytearray(16)}):
+                with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                    r.write_card_number(1, **kwargs)
+            hid.assert_not_called()
+
     def run_write(self, d, number, **kwargs):
         fake = SimpleNamespace(device=lambda: d, enumerate=lambda *a: [{'path': b'test'}])
         with patch.object(r, '_get_hid', return_value=fake), patch.object(r.time, 'sleep'):
