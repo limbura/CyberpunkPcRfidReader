@@ -1,4 +1,4 @@
-"""Чтение MIFARE Classic: блок 1, ключ A = FF FF FF FF FF FF.
+"""Чтение и запись MIFARE Classic: блок 1, ключ A = FF FF FF FF FF FF.
 
 Устройство: wCopy NSR109-HIDIC V806N / PMX-V624-C, USB 2518:6018.
 Пример: number = read_card_number()
@@ -9,13 +9,14 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 import importlib
 import logging
 import threading
 import time
 
-__version__ = "1.0.1"
+__version__ = "1.4.3"
 VID, PID = 0x2518, 0x6018
 BLOCK = 1
 KEY_A = b"\xff" * 6
@@ -83,6 +84,20 @@ class AuthenticationError(RFIDError):
 
 class CardReadError(RFIDError):
     code = "CARD_READ_FAILED"
+
+
+class CardWriteError(RFIDError):
+    code = "CARD_WRITE_FAILED"
+
+
+class VerificationError(RFIDError):
+    """После команды записи результат не подтверждён; карта могла измениться."""
+    code = "VERIFICATION_FAILED"
+
+
+class FeedbackError(RFIDError):
+    """Сбой индикации считывателя; не отменяет уже прочитанные данные карты."""
+    code = "FEEDBACK_FAILED"
 
 
 @dataclass(frozen=True)
@@ -234,11 +249,40 @@ class _Session:
     def configure(self, command: bytes, stage: str) -> None:
         _fixed_body(self.pn(command, stage), 0, stage)
 
-    def read(self) -> CardData:
+    def initialize(self) -> None:
         init = self.exchange(bytes.fromhex("FF 00 9A 5A A5 54 69 61 6E"), "initialize")
         if init != b"\0":
             raise ReaderCommandError("Считыватель не подтвердил инициализацию",
                                      stage="initialize", response=init)
+
+    def feedback_command(self, payload: bytes) -> bytes:
+        body = self.exchange(payload, "feedback")
+        # На проверенном wCopy ответ 90 01 не отражает реальный цвет LED.
+        # Принимаем известные формы ответа, но не трактуем их как физическое состояние.
+        if body == b"\0" or (len(body) == 2 and body[0] == 0x90 and body[1] <= 3):
+            return body
+        raise FeedbackError("Считыватель не подтвердил команду света/звука: " + body.hex(" "),
+                            stage="feedback", response=body)
+
+    def feedback(self, color: str, beep: bool) -> tuple[bytes, ...]:
+        replies = []
+        if beep:
+            replies.append(self.beep())
+        replies.append(self.set_led(color))
+        return tuple(replies)
+
+    def beep(self, t: int = 5) -> bytes:
+        # Та же команда, которую формирует nfcPro_x64: FF 00 40 50 04 T 01 01 01.
+        # T — значение поля команды, не миллисекунды. Цвет этим вызовом не задаём.
+        _validate_beep_t(t)
+        return self.feedback_command(bytes.fromhex("FF 00 40 50 04") + bytes([t, 1, 1, 1]))
+
+    def set_led(self, color: str) -> bytes:
+        control = {"off": 0x0C, "red": 0x0D, "green": 0x0E}[color]
+        return self.feedback_command(bytes([0xFF, 0, 0x40, control, 4, 0, 0, 0, 0]))
+
+    def read(self) -> CardData:
+        self.initialize()
         # Сохраняем последовательность из успешного аппаратного теста.
         self.configure(bytes.fromhex("32 01 00"), "rf_off")
         time.sleep(0.05)
@@ -282,6 +326,30 @@ class _Session:
         return _fixed_body(body, size + 1, stage)[1:]
 
 
+    def write_number(self, encoded: bytes, offset: int) -> CardData:
+        before = self.read()
+        expected = before.block[:offset] + encoded + before.block[offset + len(encoded):]
+        # PN InDataExchange / MIFARE Write: один блок целиком, 16 байт.
+        # Не повторяем запись автоматически при тайм-ауте/сбое.
+        self.data_exchange(bytes([0x40, 1, 0xA0, BLOCK]) + expected,
+                           0, "write", CardWriteError)
+        try:
+            # Новый RF-сеанс, поиск и авторизация: проверяем память карты,
+            # а также UID, чтобы не принять другую карту за записанную.
+            after = self.read()
+        except RFIDError as exc:
+            raise VerificationError(
+                f"Команда записи выполнена, но обратное чтение не удалось: {exc}",
+                stage="verify", status=exc.status, response=exc.response) from exc
+        if after.uid != before.uid:
+            raise VerificationError("При обратном чтении обнаружена другая карта (UID изменился)",
+                                    stage="verify", response=after.uid)
+        if after.block != expected:
+            raise VerificationError("Обратное чтение не совпало с записанным блоком",
+                                    stage="verify", response=after.block)
+        return after
+
+
 def read_card(*, path: bytes | None = None, timeout_ms: int = 2500) -> CardData:
     """Однократно прочитать блок 1 ключом A=FF…FF; открыть/закрыть USB автоматически.
 
@@ -290,6 +358,12 @@ def read_card(*, path: bytes | None = None, timeout_ms: int = 2500) -> CardData:
     Карта должна уже лежать на считывателе. Повторный вызов снова читает карту.
     Функция блокирующая. Вызовы этого модуля сериализуются внутри процесса.
     """
+    with _open_session(path, timeout_ms) as session:
+        return session.read()
+
+
+@contextmanager
+def _open_session(path: bytes | None, timeout_ms: int) -> Iterator[_Session]:
     if type(timeout_ms) is not int or not 1 <= timeout_ms <= 60000:
         raise ValueError("timeout_ms должен быть целым числом от 1 до 60000")
     if path is not None and (not isinstance(path, bytes) or not path):
@@ -313,7 +387,7 @@ def read_card(*, path: bytes | None = None, timeout_ms: int = 2500) -> CardData:
             except OSError as exc:
                 raise ReaderOpenError("Не удалось открыть HID-интерфейс; возможно, он занят или отключён",
                                       stage="open") from exc
-            return _Session(device, timeout_ms).read()
+            yield _Session(device, timeout_ms)
         except BaseException as exc:
             primary_error = exc
             raise
@@ -340,6 +414,97 @@ def read_card_number(*, path: bytes | None = None, timeout_ms: int = 2500,
         offset=offset, length=length, byteorder=byteorder)
 
 
+def write_card_number(number: int, *, path: bytes | None = None,
+                      timeout_ms: int = 2500, offset: int = 8,
+                      length: int = 8, byteorder: str = "big") -> int:
+    """Записать ID в блок 1 ключом A=FF…FF и обязательно проверить чтением.
+
+    По умолчанию меняются байты 8..15 (uint64 big-endian); остальные сохраняются.
+    Возвращает число, фактически прочитанное после записи, только при совпадении
+    всего блока и UID. Карта должна лежать на считывателе до завершения.
+    RFIDError означает, что успех НЕ подтверждён; после команды write данные
+    уже могли измениться. Автоматических повторов записи нет.
+    Формат и диапазон проверяются до обращения к оборудованию.
+    """
+    _validate_format(offset, length, byteorder)
+    if type(number) is not int or not 0 <= number < (1 << (8 * length)):
+        raise ValueError(f"number должен быть целым числом от 0 до {(1 << (8 * length)) - 1}")
+    encoded = number.to_bytes(length, byteorder, signed=False)
+    with _open_session(path, timeout_ms) as session:
+        return session.write_number(encoded, offset).to_int(
+            offset=offset, length=length, byteorder=byteorder)
+
+
+def set_led(color: str, *, path: bytes | None = None, timeout_ms: int = 2500,
+            initialize: bool = False) -> bytes:
+    """Послать команду индикации red/green/off; вернуть сырой ответ.
+
+    На NSR109-HIDIC V806N прямое задание цвета этими масками не подтверждено:
+    red/green/off ведут себя одинаково. Однако вызов после КАЖДОГО опроса,
+    включая «нет карты», нужен в проверенной схеме для штатного красного/
+    зелёного LED и писка прошивки. Сохраняйте вызовы, как в watch_example.
+    off также не гарантирует выключение LED. Ответ 90 01 не доказывает цвет.
+    Самостоятельный вызов после записи не дал видимого переключения.
+    Отдельной команды писка здесь нет; штатный звук может возникнуть сам.
+    initialize=True добавляет INIT перед командой; обычно после read/write
+    используется False. Память карты не читается и не записывается.
+    """
+    if color not in ("red", "green", "off"):
+        raise ValueError("color должен быть red, green или off")
+    if type(initialize) is not bool:
+        raise ValueError("initialize должен быть bool")
+    with _open_session(path, timeout_ms) as session:
+        if initialize:
+            session.initialize()
+        return session.set_led(color)
+
+
+def _validate_beep_t(t: int) -> None:
+    if type(t) is not int or not 1 <= t <= 255:
+        raise ValueError("t должен быть целым числом от 1 до 255 (поле T, не миллисекунды)")
+
+
+def beep(*, t: int = 5, path: bytes | None = None, timeout_ms: int = 2500,
+         initialize: bool = False) -> bytes:
+    """Подать один сигнал командой nfcPro; вернуть сырой ответ.
+
+    t — сырое поле T (целое 1..255), НЕ миллисекунды. По умолчанию 5,
+    как в обычных вызовах nfcPro. Аппаратно проверены T=1,3,5,10; увеличение
+    удлиняет писк. T=10 используется в write_example после проверки записи.
+    Для больших T может потребоваться увеличить timeout_ms (например, 5000).
+    Недопустимое t вызывает ValueError до обращения к USB.
+    initialize=True выполняет INIT; после read/write он обычно не требуется.
+    Не посылает команду установки цвета и не обращается к памяти карты.
+    """
+    _validate_beep_t(t)
+    if type(initialize) is not bool:
+        raise ValueError("initialize должен быть bool")
+    with _open_session(path, timeout_ms) as session:
+        if initialize:
+            session.initialize()
+        return session.beep(t)
+
+
+def set_reader_feedback(color: str, *, beep: bool = False, path: bytes | None = None,
+                        timeout_ms: int = 2500, initialize: bool = False) -> tuple[bytes, ...]:
+    """Совместимый комбинированный вызов команд индикации.
+
+    color: red/green/off с ограничениями set_led (прямой цвет не подтверждён).
+    beep=True: один сигнал с T=5. Для выбора T используйте отдельный beep(t=...).
+    Возвращает ответы устройства: подтверждение команды не доказывает цвет/звук.
+    initialize=True для самостоятельного теста, False после чтения в watch.
+    Не отправляет команд чтения/записи памяти карты.
+    """
+    if color not in ("red", "green", "off"):
+        raise ValueError("color должен быть red, green или off")
+    if type(beep) is not bool or type(initialize) is not bool:
+        raise ValueError("beep и initialize должны быть bool")
+    with _open_session(path, timeout_ms) as session:
+        if initialize:
+            session.initialize()
+        return session.feedback(color, beep)
+
+
 @dataclass(frozen=True)
 class CardPresented:
     """Новая успешно прочитанная карта. number — uint64, uid — байты UID."""
@@ -360,9 +525,23 @@ class CardError:
     error: RFIDError
 
 
+@dataclass(frozen=True)
+class CardState:
+    """Состояние после каждого успешного опроса или ответа «нет карты».
+
+    present учитывает removal_checks. is_new=True только при новом успешном
+    чтении; затем отдельно выдаётся CardPresented с данными. Ошибки USB и
+    авторизации не превращаются в CardState(False). Включается report_state=True.
+    """
+    present: bool
+    is_new: bool = False
+
+
 def watch_cards(*, stop: threading.Event | None = None,
                 interval: float = 0.25, removal_checks: int = 2,
-                path: bytes | None = None, timeout_ms: int = 2500) -> Iterator[CardPresented | CardError]:
+                path: bytes | None = None, timeout_ms: int = 2500,
+                feedback: bool = False, sound: bool = True,
+                report_state: bool = False) -> Iterator[CardPresented | CardError | CardState]:
     """Блокирующий генератор CardPresented / CardError; см. README.
 
     Событие карты — только после успешного чтения. Повторы одного UID подавляются
@@ -370,6 +549,14 @@ def watch_cards(*, stop: threading.Event | None = None,
     USB-сбой, тайм-аут и ошибка ключа НЕ считаются снятием карты.
     stop.set() завершает цикл после текущей операции. Запускать в рабочем потоке.
     Исключения вызывающего кода не перехватываются.
+    feedback=True: команды для штатной индикации прошивки (не прямого цвета).
+    Ошибка индикации выдаётся отдельно и отключает индикацию до перезапуска
+    генератора; чтение продолжается. Удерживаемая карта повторно не пищит.
+    sound=False отключает только нашу команду писка, сохраняя команды LED.
+    На самостоятельные звуки прошивки этот параметр не влияет.
+    report_state=True добавляет CardState на каждом опросе для индикации
+    в приложении. По умолчанию команд LED/звука нет. feedback/sound сохранены
+    для совместимости; новым приложениям лучше вызывать set_led/beep самим.
     """
     import math
     if not isinstance(interval, (int, float)) or not math.isfinite(interval) or interval <= 0:
@@ -380,10 +567,33 @@ def watch_cards(*, stop: threading.Event | None = None,
         raise ValueError("timeout_ms должен быть целым числом от 1 до 60000")
     if path is not None and (not isinstance(path, bytes) or not path):
         raise ValueError("path должен быть непустым bytes либо None")
+    if type(feedback) is not bool:
+        raise ValueError("feedback должен быть bool")
+    if type(sound) is not bool:
+        raise ValueError("sound должен быть bool")
+    if type(report_state) is not bool:
+        raise ValueError("report_state должен быть bool")
     stop = stop if stop is not None else threading.Event()
     last_uid = None
     absent = 0
     last_error = None
+    feedback_enabled = feedback
+
+    def update_feedback(color, beep=False):
+        nonlocal feedback_enabled
+        if not feedback_enabled:
+            return None
+        try:
+            set_reader_feedback(color, beep=beep, path=path, timeout_ms=timeout_ms)
+        except RFIDError as error:
+            feedback_enabled = False
+            failure = FeedbackError(
+                f"Индикация отключена до перезапуска наблюдения: {error}",
+                stage="feedback", status=error.status, response=error.response)
+            failure.__cause__ = error
+            return CardError(failure)
+        return None
+
     while not stop.is_set():
         try:
             card = read_card(path=path, timeout_ms=timeout_ms)
@@ -392,17 +602,30 @@ def watch_cards(*, stop: threading.Event | None = None,
             last_error = None
             if absent >= removal_checks:
                 last_uid = None
+            warning = update_feedback("green" if last_uid is not None else "red")
+            if report_state:
+                yield CardState(last_uid is not None)
+            if warning is not None:
+                yield warning
         except RFIDError as error:
             absent = 0
             signature = (error.code, error.stage, error.status)
             if signature != last_error:
                 last_error = signature
                 yield CardError(error)
+            # USB/ошибки поиска не доказывают наличие рабочего канала управления.
+            # Не создаём повторные задержки дополнительными запросами при сбоях.
         else:
             absent = 0
             last_error = None
-            if card.uid != last_uid:
+            is_new = card.uid != last_uid
+            warning = update_feedback("green", beep=is_new and sound)
+            if report_state:
+                yield CardState(True, is_new)
+            if is_new:
                 last_uid = card.uid
                 yield CardPresented(card)
+            if warning is not None:
+                yield warning
         if stop.wait(interval):
             break
