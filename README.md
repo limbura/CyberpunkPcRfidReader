@@ -14,24 +14,49 @@
 
 Нужно добавить после покупки считывателей аналогичные устройства семейства, например WBW106-IDIC, у них будет другой  VID / PID
 
-Номер версии менять в **wcopy_reader.py**, вначале `__version__ = ""`
+Номер версии задаётся в [`wcopy_reader_package/wcopy_reader.py`](wcopy_reader_package/wcopy_reader.py),
+в переменной `__version__`. При выпуске новой версии обновите также заголовок этого README.
+Имя папки `wcopy_reader_package` от версии не зависит.
 
 Для PMX-V624-C / wCopy NSR109-HIDIC V806N, USB 2518:6018, HID interface 0.
-Python 3.11+, зависимость `hidapi` из requirements.txt.
+Python 3.11+, зависимость `hidapi` из [requirements.txt](wcopy_reader_package/requirements.txt).
 MIFARE Classic: **блок 1 сектора 0**, **ключ A = FF FF FF FF FF FF**.
 ID по умолчанию — **байты 8…15**, беззнаковое 64-битное число **big-endian**.
 
 ## Быстрый запуск на Windows
 
-Распакуйте архив. Если обновляете прежнюю папку, замените файлы и сохраните `.venv`.
+Клонируйте репозиторий или распакуйте его архив. README находится в корне репозитория,
+а библиотека, зависимости, примеры и тесты — в папке `wcopy_reader_package`.
+
+| Путь от корня репозитория | Назначение |
+|---|---|
+| `wcopy_reader_package/wcopy_reader.py` | Модуль библиотеки |
+| `wcopy_reader_package/requirements.txt` | Зависимости библиотеки |
+| `wcopy_reader_package/examples/` | Примеры чтения, записи и наблюдения |
+| `wcopy_reader_package/tests_and_other/` | Автотесты и ручная диагностика |
+| `wcopy_reader_package/PROTOCOL.md` | Описание реализованного протокола |
+| `raw_test_scripts/` | Ранние исследовательские скрипты; для обычной работы не нужны |
+| `original_exe/` | Программы производителя; библиотека их не запускает |
+
+Откройте терминал в корне репозитория и перейдите в папку библиотеки:
+
+```powershell
+cd .\wcopy_reader_package
+```
+
+**Все команды ниже выполняются из этой папки.** Если терминал уже открыт в ней,
+повторять `cd` не нужно. Для обновления существующего клона используйте Pull;
+локальное окружение `.venv` в репозиторий не входит.
 Закройте nfcPro и другие приложения, работающие со считывателем.
 При первом запуске в новой папке:
 
 ```powershell
-py -3.14 -m venv .venv
+py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
+Команда `py -3` должна выбирать Python 3.11 или новее. После обновления библиотеки
+повторите установку из `requirements.txt`, используя существующее окружение.
 Запускайте именно Python из окружения, куда установили hidapi:
 
 ```powershell
@@ -125,6 +150,16 @@ SUCCESS_BEEP_T в write_example определяет значение T отде
 команды отключаются до перезапуска, а события карт продолжают поступать.
 
 ## Чтение и запись в своём приложении
+
+Библиотека не зависит от менеджера или БД. Чтобы выполнить `import wcopy_reader`,
+папка `wcopy_reader_package` должна быть доступна в пути поиска модулей Python.
+Примеры из `examples/` добавляют её автоматически относительно своего файла,
+поэтому запускаются и из другой текущей папки.
+Установка `requirements.txt` устанавливает hidapi, но не сам модуль `wcopy_reader`.
+В [CyberpunkMasterManager](https://github.com/limbura/CyberpunkMasterManager)
+путь к библиотеке задаётся в `config.toml`; менеджер загружает её самостоятельно.
+В этой системе число в памяти карты — `main.card_id`, а ID на наклейке — `main.id`.
+Библиотека не различает эти понятия и записывает именно переданное число.
 
 ```python
 from wcopy_reader import read_card_number, write_card_number, set_led, beep, RFIDError
@@ -279,7 +314,7 @@ Tee-Object не нужен. DEBUG включает UID, данные карты 
 и обратная проверка, события карт, отдельные команды LED/звука, отсутствие
 сигнала при неудачной проверке записи, сохранение успеха при сбое пищалки.
 Аппаратная проверка новых сценариев остаётся за пользователем.
-Детали транспорта и источники команд — в PROTOCOL.md.
+Детали транспорта и источники команд — в [PROTOCOL.md](wcopy_reader_package/PROTOCOL.md).
 
 ## Версия 1.4.1
 
@@ -296,7 +331,7 @@ Tee-Object не нужен. DEBUG включает UID, данные карты 
 не менялось. Экспериментальные локальные правки write_example в эту сборку не входят.
 
 Запустите кнопкой VS Code файл `tests_and_other/indication_diagnostics.py` или
-из основной папки проекта:
+из папки `wcopy_reader_package`:
 
 ```powershell
 .\.venv\Scripts\python.exe .\tests_and_other\indication_diagnostics.py
@@ -354,4 +389,4 @@ Tee-Object не нужен. DEBUG включает UID, данные карты 
 - beep(t=5) позволяет передавать длительность T; прежний beep() теперь использует 5.
 - watch_example по-прежнему не отправляет отдельный писк по умолчанию.
 - write_example после подтверждённой записи вызывает beep(t=10).
-- Результаты опытов и разбора nfcPro также зафиксированы в PROTOCOL.md.
+- Результаты опытов и разбора nfcPro также зафиксированы в [PROTOCOL.md](wcopy_reader_package/PROTOCOL.md).
