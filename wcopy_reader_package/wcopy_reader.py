@@ -1,6 +1,6 @@
 """Чтение и запись MIFARE Classic: блок 1, ключ A = FF FF FF FF FF FF.
 
-Устройство: wCopy NSR109-HIDIC V806N / PMX-V624-C, USB 2518:6018.
+Устройства: wCopy NSR109 / PMX-V624-C и Cyb_Nfctool (аппаратная проверка ожидается).
 Пример: number = read_card_number()
 Ошибки оборудования/протокола: RFIDError и его подклассы.
 Неверные аргументы API: ValueError. См. README.md и PROTOCOL.md.
@@ -16,8 +16,9 @@ import logging
 import threading
 import time
 
-__version__ = "1.4.4"
+__version__ = "1.5.0"
 VID, PID = 0x2518, 0x6018
+CYB_USB_IDS = ((0x0483, 0x4300), (0x0483, 0x4343))
 BLOCK = 1
 KEY_A = b"\xff" * 6
 _LOCK = threading.Lock()
@@ -106,6 +107,9 @@ class ReaderInfo:
     product: str
     manufacturer: str
     interface: int | None
+    backend: str = "wcopy"
+    vendor_id: int = VID
+    product_id: int = PID
 
 
 def _validate_format(offset: int, length: int, byteorder: str) -> None:
@@ -149,17 +153,40 @@ def _get_hid():
 
 
 def _enumerate(hid) -> tuple[ReaderInfo, ...]:
+    readers = []
+    seen = set()
     try:
-        devices = hid.enumerate(VID, PID)
+        for vid, pid in ((VID, PID), *CYB_USB_IDS):
+            for device in hid.enumerate(vid, pid):
+                path = device["path"]
+                if path in seen:
+                    continue
+                if (vid, pid) == (VID, PID):
+                    if device.get("interface_number") not in (0, -1, None):
+                        continue
+                    backend = "wcopy"
+                else:
+                    # Same descriptor checks as Cyb_Nfctool FindDevIsOk.
+                    # ST's VID alone is not a sufficient device identification.
+                    if not all(marker in (device.get(field) or "") for field, marker in (
+                        ("manufacturer_string", "CYBDZKJ-BSJ"),
+                        ("product_string", "TCC-TSY-TBY"),
+                        ("serial_number", "BEGIN-2025"),
+                    )):
+                        continue
+                    backend = "cyb"
+                seen.add(path)
+                readers.append(ReaderInfo(
+                    path, device.get("product_string") or "",
+                    device.get("manufacturer_string") or "", device.get("interface_number"),
+                    backend, vid, pid))
     except OSError as exc:
         raise USBError("Ошибка перечисления HID-устройств", stage="enumerate") from exc
-    return tuple(ReaderInfo(d["path"], d.get("product_string") or "",
-                            d.get("manufacturer_string") or "", d.get("interface_number"))
-                 for d in devices if d.get("interface_number") in (0, -1, None))
+    return tuple(readers)
 
 
 def list_readers() -> tuple[ReaderInfo, ...]:
-    """Найти 2518:6018, HID interface 0. Пустой результат — пустой tuple."""
+    """Найти поддерживаемые wCopy и Cyb HID-считыватели; без отправки команд."""
     return _enumerate(_get_hid())
 
 
@@ -326,6 +353,10 @@ class _Session:
         return _fixed_body(body, size + 1, stage)[1:]
 
 
+    def write_block(self, block: bytes) -> None:
+        self.data_exchange(bytes([0x40, 1, 0xA0, BLOCK]) + block,
+                           0, "write", CardWriteError)
+
     def write_number(self, encoded: bytes, offset: int, *, expected_uid=None, expected_block=None) -> CardData:
         before = self.read()
         if expected_uid is not None and before.uid != expected_uid:
@@ -337,8 +368,7 @@ class _Session:
         expected = before.block[:offset] + encoded + before.block[offset + len(encoded):]
         # PN InDataExchange / MIFARE Write: один блок целиком, 16 байт.
         # Не повторяем запись автоматически при тайм-ауте/сбое.
-        self.data_exchange(bytes([0x40, 1, 0xA0, BLOCK]) + expected,
-                           0, "write", CardWriteError)
+        self.write_block(expected)
         try:
             # Новый RF-сеанс, поиск и авторизация: проверяем память карты,
             # а также UID, чтобы не принять другую карту за записанную.
@@ -354,6 +384,177 @@ class _Session:
             raise VerificationError("Обратное чтение не совпало с записанным блоком",
                                     stage="verify", response=after.block)
         return after
+
+
+def _cyb_checksum(payload: bytes) -> bytes:
+    # Manufacturer implementation uses an 8-bit length for XOR (even though
+    # the frame's length field is 16-bit). Normal requests here are < 256 bytes.
+    value = 0
+    for byte in payload[:len(payload) & 255]:
+        value ^= byte
+    return bytes([value ^ 255, value])
+
+
+def _cyb_request(command: int, payload: bytes) -> bytes:
+    if len(payload) > 2041:
+        raise ValueError("Слишком длинный пакет Cyb")
+    return (b"\x55" + command.to_bytes(2, "big") + len(payload).to_bytes(2, "big")
+            + payload + _cyb_checksum(payload))
+
+
+class _CybSession(_Session):
+    """Cyb_Nfctool native protocol. Static reverse engineering; hardware pending.
+
+    Inherits the public write safety checks, not the wCopy USB framing.
+    Only normal block access with known keys is used, never magic-card modes.
+    """
+
+    def __init__(self, device, timeout_ms: int):
+        super().__init__(device, timeout_ms)
+        self.host_control = False
+        self.host_requested = False
+        self.buffer = bytearray()
+
+    def _drain(self, stage: str) -> None:
+        self.buffer.clear()
+        try:
+            for _ in range(32):
+                if not self.device.read(65, 1):
+                    return
+        except OSError as exc:
+            raise USBError("Ошибка очистки входного потока Cyb", stage=stage) from exc
+        raise ProtocolError("Непрерывный поток Cyb; закройте другие программы", stage=stage)
+
+    def exchange_cyb(self, command: int, payload: bytes, stage: str) -> bytes:
+        # No sequence IDs: discard old queued replies BEFORE the new request.
+        # Never retry commands (especially writes) on timeout.
+        self._drain(stage)
+        packet = _cyb_request(command, payload)
+        _LOG.debug("%s CYB TX %s", stage, packet.hex(" "))
+        try:
+            for start in range(0, len(packet), 64):
+                report = b"\0" + packet[start:start + 64]
+                if self.device.write(report) != len(report):
+                    raise USBError("Неполная передача Cyb по USB", stage=stage)
+        except OSError as exc:
+            raise USBError("Ошибка отправки команды Cyb", stage=stage) from exc
+        deadline = time.monotonic() + self.timeout_ms / 1000
+        for _ in range(128):
+            while self.buffer:
+                # HID reports may be zero-padded; frame bytes are a stream.
+                if self.buffer[0] == 0:
+                    del self.buffer[0]
+                    continue
+                if self.buffer[0] != 0x55:
+                    raise ProtocolError("Неизвестный заголовок Cyb", stage=stage,
+                                        response=bytes(self.buffer))
+                if len(self.buffer) < 5:
+                    break
+                size = int.from_bytes(self.buffer[3:5], "big")
+                if size > 2041:
+                    raise ProtocolError("Некорректная длина пакета Cyb", stage=stage,
+                                        response=bytes(self.buffer))
+                if len(self.buffer) < size + 7:
+                    break
+                frame = bytes(self.buffer[:size + 7])
+                del self.buffer[:size + 7]
+                body = frame[5:-2]
+                if frame[-2:] != _cyb_checksum(body):
+                    raise ProtocolError("Контрольная сумма Cyb не совпала", stage=stage,
+                                        response=frame)
+                if int.from_bytes(frame[1:3], "big") == command:
+                    return body
+                _LOG.debug("%s CYB unrelated frame %s", stage, frame.hex(" "))
+            remaining = int((deadline - time.monotonic()) * 1000)
+            if remaining <= 0:
+                break
+            try:
+                raw = bytes(self.device.read(65, remaining))
+            except OSError as exc:
+                raise USBError("Ошибка получения ответа Cyb", stage=stage) from exc
+            if not raw:
+                break
+            _LOG.debug("%s CYB RX %s", stage, raw.hex(" "))
+            if len(raw) == 65 and raw[0] == 0:
+                raw = raw[1:]
+            self.buffer.extend(raw)
+        if self.buffer.strip(b"\0"):
+            raise ProtocolError("Неполный ответ Cyb", stage=stage, response=bytes(self.buffer))
+        raise ReaderTimeoutError("Cyb не ответил за отведённое время", stage=stage)
+
+    def initialize(self) -> None:
+        if self.host_control:
+            return
+        self.host_requested = True
+        body = self.exchange_cyb(0x51, b"\x01", "initialize")
+        if body != b"\x01":
+            raise ReaderCommandError("Cyb не подтвердил управление с ПК", stage="initialize",
+                                     response=body)
+        self.host_control = True
+
+    def release(self) -> None:
+        if not self.host_requested:
+            return
+        body = self.exchange_cyb(0x51, b"\0", "release")
+        if body != b"\0":
+            raise ReaderCommandError("Cyb не подтвердил автономный режим", stage="release",
+                                     response=body)
+        self.host_control = self.host_requested = False
+
+    def _poll(self) -> tuple[bytes, bytes, int]:
+        body = self.exchange_cyb(0x69, b"", "poll")
+        # status, type, iso14a_card_select_t (17 bytes), optional ATS.
+        if len(body) < 19:
+            raise ProtocolError("Неполный ответ информации о карте Cyb", stage="poll", response=body)
+        if body[0] == 0:
+            raise NoCardError("Карта не обнаружена Cyb", stage="poll", response=body)
+        size, sak = body[12], body[15]
+        if size not in (4, 7) or sak not in (0x08, 0x18, 0x09, 0x88):
+            raise UnsupportedCardError("Cyb: карта не поддерживается как MIFARE Classic",
+                                       stage="poll", response=body)
+        # Native ATQA is in ISO14443A wire order; retain the PN-style API order.
+        return body[2:2 + size], body[13:15][::-1], sak
+
+    @staticmethod
+    def _block_parameters() -> bytes:
+        # start block, count, normal access (0), key A, key B.
+        # Both keys are supplied by this protocol; no key-search operation.
+        return bytes([BLOCK, 1, 0]) + KEY_A + KEY_A
+
+    def read(self) -> CardData:
+        self.initialize()
+        uid, atqa, sak = self._poll()
+        body = self.exchange_cyb(0x6C, self._block_parameters(), "read")
+        if len(body) != 20:
+            raise ProtocolError("Ожидались маска результата и 16 байт блока Cyb",
+                                stage="read", response=body)
+        mask = int.from_bytes(body[:4], "big")
+        if mask != 1:
+            raise CardReadError("Cyb не прочитал блок 1; проверьте карту и ключ",
+                                stage="read", status=mask, response=body)
+        after_uid, after_atqa, after_sak = self._poll()
+        if (after_uid, after_atqa, after_sak) != (uid, atqa, sak):
+            raise VerificationError("Карта изменилась во время чтения Cyb",
+                                    stage="read", response=after_uid)
+        return CardData(uid, body[4:], atqa, sak)
+
+    def write_block(self, block: bytes) -> None:
+        body = self.exchange_cyb(0x6A, self._block_parameters() + block, "write")
+        if len(body) != 4:
+            raise ProtocolError("Некорректный ответ записи Cyb", stage="write", response=body)
+        mask = int.from_bytes(body, "big")
+        if mask != 1:
+            raise CardWriteError("Cyb не подтвердил запись блока 1", stage="write",
+                                 status=mask, response=body)
+
+    def set_led(self, color: str) -> bytes:
+        raise FeedbackError("Управление LED Cyb пока не подтверждено; чтение/запись доступны",
+                            stage="feedback")
+
+    def beep(self, t: int = 5) -> bytes:
+        _validate_beep_t(t)
+        raise FeedbackError("Управление пищалкой Cyb пока не подтверждено; чтение/запись доступны",
+                            stage="feedback")
 
 
 def read_card(*, path: bytes | None = None, timeout_ms: int = 2500) -> CardData:
@@ -380,7 +581,7 @@ def _open_session(path: bytes | None, timeout_ms: int) -> Iterator[_Session]:
         if path is not None:
             readers = tuple(r for r in readers if r.path == path)
         if not readers:
-            raise ReaderNotFoundError("Считыватель 2518:6018 не найден", stage="enumerate")
+            raise ReaderNotFoundError("Поддерживаемый считыватель wCopy / Cyb не найден", stage="enumerate")
         if len(readers) != 1:
             raise MultipleReadersError("Найдено несколько считывателей; задайте path из list_readers()",
                                        stage="enumerate")
@@ -393,7 +594,20 @@ def _open_session(path: bytes | None, timeout_ms: int) -> Iterator[_Session]:
             except OSError as exc:
                 raise ReaderOpenError("Не удалось открыть HID-интерфейс; возможно, он занят или отключён",
                                       stage="open") from exc
-            yield _Session(device, timeout_ms)
+            session = (_CybSession if readers[0].backend == "cyb" else _Session)(device, timeout_ms)
+            try:
+                yield session
+            finally:
+                # Preserve the primary error if releasing host control also fails.
+                import sys
+                active_error = sys.exception()
+                if isinstance(session, _CybSession):
+                    try:
+                        session.release()
+                    except RFIDError as exc:
+                        if active_error is None:
+                            raise
+                        active_error.add_note(f"Не удалось вернуть автономный режим Cyb: {exc}")
         except BaseException as exc:
             primary_error = exc
             raise

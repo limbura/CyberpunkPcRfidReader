@@ -32,3 +32,6 @@ rfid_test_log_*.txt
 # Кэш Python
 __pycache__/
 *.py[cod]
+
+# Local hardware diagnostics (UIDs and card data)
+wcopy_reader_package/diagnostics_logs/
