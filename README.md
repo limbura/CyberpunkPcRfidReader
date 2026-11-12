@@ -71,6 +71,24 @@ number = write_card_number(555)            # Сигнал только посл�
 card = read_card(auto_feedback=False)      # Без автоматических команд LED/звука
 ```
 
+### Изолированное исследование задержки Cyb 0x69
+
+Отдельный сценарий для измерения скорости поиска карты без чтения блоков,
+записи и звука: `wcopy_reader_package/tests_and_other/cyb_69_diagnostics.py`.
+Закройте Master Manager и штатное приложение Cyb, затем из корня репозитория:
+
+```powershell
+python wcopy_reader_package/tests_and_other/cyb_69_diagnostics.py
+```
+
+По запросам уберите карту, затем приложите одну MIFARE Classic и держите
+неподвижно. По умолчанию проверяются 3 режима (повторное открытие USB,
+постоянное открытие с повторением 51=01 и без повторения 51=01) по 30 опросов
+с паузой 0,1 с, отдельно без карты и с картой. Результаты — файлы
+`cyb_69_*.csv`, `*.json` и `*.log` в `diagnostics_logs`.
+Для сравнения пауз: `--intervals 0,0.1,0.5`.
+Полная инструкция: [CYB_PERFORMANCE.md](wcopy_reader_package/CYB_PERFORMANCE.md).
+
 ### Первая проверка Cyb
 
 Закройте Cyb_Nfctool/nfcPro. Из папки `wcopy_reader_package`, после установки зависимостей:
