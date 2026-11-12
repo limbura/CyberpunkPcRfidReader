@@ -33,6 +33,13 @@ def probe(session, payload):
     """
     if payload not in {p for _, _, p in ORIGINAL + VARIANTS}:
         raise ValueError('Пакет вне фиксированного набора диагностики')
+    return send_payload(session, payload)
+
+
+def send_payload(session, payload):
+    """Send exactly four user-selected bytes to indication command 0x55 only."""
+    if not isinstance(payload, bytes) or len(payload) != 4:
+        raise ValueError('Нужно ровно 4 байта параметров индикации')
     session._drain('feedback_probe')
     frame = r._cyb_request(0x55, payload)
     report = b'\0' + frame
