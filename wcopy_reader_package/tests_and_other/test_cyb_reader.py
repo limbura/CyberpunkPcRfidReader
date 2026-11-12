@@ -81,6 +81,8 @@ class Device:
 class CybTests(unittest.TestCase):
     def setUp(self):
         r._PRESENCE.clear()
+        r._OWNED_CYB.clear()
+        self.addCleanup(r._OWNED_CYB.clear)
 
     def run_device(self, device, callback=None, descriptors=None):
         devices = descriptors if descriptors is not None else [descriptor()]
@@ -95,13 +97,13 @@ class CybTests(unittest.TestCase):
         self.assertEqual(r._cyb_request(0x6C, b'\1\1\0' + b'\xff'*12).hex(),
                          '55006c000f010100ffffffffffffffffffffffffff00')
 
-    def test_read_and_release(self):
+    def test_read_keeps_host_mode_and_closes_usb(self):
         d = Device()
         card = self.run_device(d)
         self.assertEqual(card, r.CardData(UID, BLOCK, b'\0\4', 8))
         self.assertEqual(card.number, 513)
-        self.assertEqual([int.from_bytes(x[2:4], 'big') for x in d.sent], [0x51,0x69,0x6c,0x69,0x55,0x51])
-        self.assertEqual(d.sent[-1][6], 0)
+        self.assertEqual([int.from_bytes(x[2:4], 'big') for x in d.sent], [0x51,0x69,0x6c,0x69,0x55])
+        self.assertFalse(any(x[2:4] == b'\0\x51' and x[6:-2] == b'\0' for x in d.sent))
         self.assertTrue(d.closed)
 
     def test_fragmentation(self):
@@ -120,7 +122,7 @@ class CybTests(unittest.TestCase):
         d = Device(failures={0x69:frame(0x69,b'\0'*19)})
         with self.assertRaises(r.NoCardError): self.run_device(d)
         self.assertTrue(d.closed)
-        self.assertEqual(d.sent[-1][6], 0)
+        self.assertFalse(any(x[2:4] == b'\0\x51' and x[6:-2] == b'\0' for x in d.sent))
 
     def test_bad_read_replies(self):
         for reply, error in [
@@ -273,7 +275,7 @@ class CybTests(unittest.TestCase):
         self.assertEqual(result, 999)
         self.assertEqual(sum(x[3] == 0x6A for x in d.sent), 1)
         self.assertEqual(d.sent[0][6], 1)
-        self.assertEqual(d.sent[-1][6], 0)
+        self.assertFalse(any(x[2:4] == b'\0\x51' and x[6:-2] == b'\0' for x in d.sent))
         self.assertTrue(d.closed)
 
     def test_invalid_write_counts_are_not_accepted(self):
@@ -308,7 +310,7 @@ class CybTests(unittest.TestCase):
             if report[3]==0x51 and report[6]==0:raise OSError('unplugged')
             return write(report)
         d.write=fail_release
-        with self.assertRaises(r.NoCardError) as ctx:self.run_device(d)
+        with patch.object(r, "_PERSISTENT_HOST_CONTROL", False), self.assertRaises(r.NoCardError) as ctx:self.run_device(d)
         self.assertTrue(ctx.exception.__notes__)
         self.assertTrue(d.closed)
 

@@ -65,10 +65,17 @@ access to the reader. USB reads and drains are bounded.
 
 `CMD_SYS_HOST_TAKEOVER_ENABLE=0x51` in DWARF.
 Function 0x4AB7C6 sends one byte (1 to enable, 0 to disable) and expects that byte
-back. Its caller enables around a task and disables afterward. The library does
-this per opened session, including cleanup after failures. Cleanup errors do not
-replace a primary error: they are attached via `add_note`. If no earlier error
-exists, a release error is reported; a write may already have succeeded.
+back. The original application enables around a task and disables afterward.
+As of 1.7.0, the library confirms 51=01 in every read/write session but retains
+confirmed takeover between operations, including NoCard and card-operation errors.
+HID handles still close after each call. Reassertion avoids relying on cached
+firmware state after reconnect. Failed initialization attempts release immediately;
+cleanup failure is attached to the original exception, and ownership is retained
+for a later retry. No card write is retried.
+close_readers() releases only owned Cyb paths under the I/O lock; it logs errors
+and returns False on failure. Python atexit also calls it, but forced termination
+cannot guarantee cleanup. set_persistent_host_control(False) releases owned paths
+and restores the earlier per-operation takeover/release behavior.
 
 ## Card information
 
@@ -134,8 +141,8 @@ integer; legacy wCopy ignores count and still sends one signal.
 red/green send 00 01 01 00 (silent red LED on); off sends 00 00 00 00.
 Combined feedback sends LED first, sound second, to avoid cancelling sound;
 the sound pattern may turn LED back on even when color=off.
-No host takeover by default for indication. Explicit initialize=True still
-releases host control on exit. Selected Cyb indication I/O failures are logged
+No host takeover by default for manual indication. Explicit initialize=True
+now follows the persistent-control setting. Selected Cyb indication I/O failures are logged
 and suppressed, while argument/discovery errors and card-operation errors remain
 visible. No retry and no fabricated acknowledgement: return empty bytes.
 These mappings are based on manual hardware observations; the integrated API
@@ -211,7 +218,8 @@ prewrite and verification reads cannot emit read beeps. Cyb read uses 01 01 01 0
 once per presentation; verified write uses 01 01 02 00. No periodic Cyb LED command.
 Legacy wCopy refreshes LED after successful/absent reads, and after verified write
 refreshes LED then beeps T=10. Automatic indication failures are logged separately.
-Host control still releases after every operation. Autonomous beeps remain.
+In 1.6.0 host control released after every operation. Version 1.7.0 retains it
+until explicit/atexit cleanup; hardware reliability in this mode is pending.
 Presentation state is serialized with I/O, keyed by HID path, and rearms after
 changed UID or two consecutive absent responses. Errors interrupt absence counts.
 CardData exposes is_new and presentation_id; is_card_removed reads cached absence

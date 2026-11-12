@@ -12,6 +12,8 @@ from test_cyb_reader import Device, descriptor, frame, UID, BLOCK
 class AutoFeedbackTests(unittest.TestCase):
     def setUp(self):
         r._PRESENCE.clear()
+        r._OWNED_CYB.clear()
+        self.addCleanup(r._OWNED_CYB.clear)
         self.device = Device()
         self.descriptors = [descriptor()]
         fake = SimpleNamespace(device=lambda: self.device,
@@ -73,7 +75,7 @@ class AutoFeedbackTests(unittest.TestCase):
         commands = [int.from_bytes(x[2:4], 'big') for x in self.device.sent]
         self.assertEqual(commands.count(0x6c), 2)
         self.assertGreater(commands.index(0x55), max(i for i,c in enumerate(commands) if c == 0x6c))
-        self.assertEqual(commands[-1], 0x51)  # Still releases host control.
+        self.assertEqual(commands[-1], 0x55)  # Host control stays enabled.
         self.assertFalse(r.read_card().is_new)
         self.assertEqual(len(self.signals()), 1)
 
@@ -97,7 +99,8 @@ class AutoFeedbackTests(unittest.TestCase):
             self.assertEqual(r.read_card().block, BLOCK)
             r._PRESENCE.clear()
             self.assertEqual(r.write_card_number(555), 555)
-        self.assertEqual(self.device.sent[-1][6:-2], b'\0')
+        self.assertFalse(any(x[2:4] == b'\0\x51' and x[6:-2] == b'\0'
+                             for x in self.device.sent))
 
     def test_old_reader_updates_led_without_read_beep_and_write_ten(self):
         self.descriptors = [dict(path=b'old', vendor_id=r.VID, product_id=r.PID, interface_number=0)]

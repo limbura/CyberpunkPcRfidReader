@@ -12,12 +12,13 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
+import atexit
 import importlib
 import logging
 import threading
 import time
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 VID, PID = 0x2518, 0x6018
 CYB_USB_IDS = ((0x0483, 0x4300), (0x0483, 0x4343))
 BLOCK = 1
@@ -155,6 +156,89 @@ _PRESENCE: dict[bytes, _Presence] = {}
 _LAST_READER_PATH: bytes | None = None
 _PRESENTATION_SEQUENCE = 0
 _AUTO_SOUND = ContextVar("wcopy_auto_sound", default=True)
+
+
+_PERSISTENT_HOST_CONTROL = True
+# Only devices this process attempted to take over; never release unrelated readers.
+_OWNED_CYB: dict[bytes, int] = {}
+
+
+def _release_readers_locked(path: bytes | None = None) -> bool:
+    selected = [(p, timeout) for p, timeout in _OWNED_CYB.items()
+                if path is None or path == p]
+    if not selected:
+        return True
+    try:
+        hid = _get_hid()
+        available = {r.path for r in _enumerate(hid) if r.backend == "cyb"}
+    except (RFIDError, OSError) as error:
+        _LOG.warning("Не удалось найти Cyb для возврата автономного режима: %s", error)
+        return False
+    success = True
+    for device_path, timeout in selected:
+        if device_path not in available:
+            # Keep ownership for a later retry if the device reconnects.
+            success = False
+            _LOG.warning("Cyb отключён; автономный режим не подтверждён: %r", device_path)
+            continue
+        device = None
+        try:
+            device = hid.device()
+            device.open_path(device_path)
+            session = _CybSession(device, timeout)
+            session.host_requested = True
+            session.release()
+            _OWNED_CYB.pop(device_path, None)
+        except (RFIDError, OSError) as error:
+            success = False
+            _LOG.warning("Не удалось вернуть автономный режим Cyb: %s", error)
+        finally:
+            if device is not None:
+                try:
+                    device.close()
+                except OSError as error:
+                    success = False
+                    _LOG.warning("Ошибка закрытия Cyb при завершении: %s", error)
+    return success
+
+
+def close_readers(*, path: bytes | None = None) -> bool:
+    """Вернуть захваченные этим процессом Cyb в автономный режим.
+
+    Дожидается текущей операции под общей блокировкой. Сначала остановите свой
+    цикл опроса. Без path освобождает все использованные Cyb, с path — один.
+    Возвращает True при успехе (включая отсутствие захватов); сбои журналируются
+    и возвращают False, не отменяя результатов чтения/записи. Вызов повторяемый.
+    Последующий read/write снова включит управление с ПК.
+    Автоматически вызывается через atexit при обычном завершении Python.
+    При принудительном убийстве процесса atexit не гарантируется; переподключите
+    USB для аппаратного сброса. Старые wCopy эта функция не затрагивает.
+    """
+    if path is not None and (not isinstance(path, bytes) or not path):
+        raise ValueError("path должен быть непустым bytes либо None")
+    with _LOCK:
+        return _release_readers_locked(path)
+
+
+def set_persistent_host_control(enabled: bool = True) -> bool:
+    """Сохранять управление Cyb с ПК между операциями (по умолчанию True).
+
+    USB-дескриптор закрывается после каждой операции. Каждое новое read/write
+    подтверждает режим 51=01 заново, поэтому не использует кэш после переподключения.
+    False сразу пытается освободить захваченные Cyb и включает прежний режим:
+    захват перед операцией, освобождение после неё. True действует со следующей
+    операции; само устройство не открывает. Возврат — успех освобождения.
+    Автоматическая индикация управляется отдельно параметром auto_feedback.
+    """
+    if type(enabled) is not bool:
+        raise ValueError("enabled должен быть bool")
+    global _PERSISTENT_HOST_CONTROL
+    with _LOCK:
+        _PERSISTENT_HOST_CONTROL = enabled
+        return True if enabled else _release_readers_locked()
+
+
+atexit.register(close_readers)
 
 
 def _record_card(state: _Presence, card: CardData) -> CardData:
@@ -663,7 +747,9 @@ def read_card(*, path: bytes | None = None, timeout_ms: int = 2500,
     auto_feedback=True: Cyb пищит один раз t=5 при новом прикладывании;
     wCopy обновляет LED после чтения и NoCardError, отдельного писка нет.
     False отключает автоматическую индикацию, но не отслеживание карты.
-    Самостоятельные звуки прошивки не отключаются. Сбои индикации журналируются.
+    По умолчанию Cyb сохраняет управление с ПК между операциями, подавляя
+    автономный писк после первого захвата. Завершение — close_readers().
+    Сбои индикации журналируются.
     """
     _validate_auto_feedback(auto_feedback)
     with _open_session(path, timeout_ms) as session:
@@ -727,13 +813,18 @@ def _open_session(path: bytes | None, timeout_ms: int, *, feedback: bool = False
                 # Preserve the primary error if releasing host control also fails.
                 import sys
                 active_error = sys.exception()
-                if isinstance(session, _CybSession):
-                    try:
-                        session.release()
-                    except RFIDError as exc:
-                        if active_error is None:
-                            raise
-                        active_error.add_note(f"Не удалось вернуть автономный режим Cyb: {exc}")
+                if isinstance(session, _CybSession) and session.host_requested:
+                    _OWNED_CYB[readers[0].path] = timeout_ms
+                    # A confirmed takeover persists even after NoCard/read/write
+                    # errors. Failed initialization is uncertain: try to release.
+                    if not (_PERSISTENT_HOST_CONTROL and session.host_control):
+                        try:
+                            session.release()
+                            _OWNED_CYB.pop(readers[0].path, None)
+                        except RFIDError as exc:
+                            if active_error is None:
+                                raise
+                            active_error.add_note(f"Не удалось вернуть автономный режим Cyb: {exc}")
         except BaseException as exc:
             primary_error = exc
             if not isinstance(exc, NoCardError) and not feedback:
