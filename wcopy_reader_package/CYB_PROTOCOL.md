@@ -1,6 +1,7 @@
 # Cyb_Nfctool: native HID protocol
 
-Status: implementation based on static analysis, **not yet tested on hardware**.
+Status: based on static analysis; read/write and host-control confirmed on the
+user’s 0483:4343 device on 2026-11-12. Indication remains experimental.
 The fixtures in `test_cyb_reader.py` are constructed from that analysis; they are
 not physical-device captures. Do not treat passing tests as hardware validation.
 
@@ -156,3 +157,38 @@ requested length or the known 65-byte report size and logs both values. Regressi
 tests emulate a Windows backend returning 65 for every short write and ensure
 write/read-back/release work without resending the write. A repeat hardware
 run is still required; these logs did not yet validate the frame responses.
+
+## Indication investigation / hardware observations
+
+The follow-up 1.5.1 hardware runs confirmed card absence, repeated reading,
+writing 2 → 555 with full-block/UID read-back, and release. USB writes returned
+65 for short reports. This validates the Windows count correction for this device.
+
+User observation: in autonomous operation without host commands, card presentation
+causes two beeps; the LED is always red. Neither a controllable LED nor a physically
+power-wired LED is established by this observation.
+
+Additional DWARF evidence (CU 0xC5BACF, declaration file 166): AGREEMEN_BEEP_E
+contains BEEP_2_CNT=0 and BEEP_LONG=1. Function 0x461CC0 branches on this value:
+
+| Enum | First three payload bytes | Fourth byte |
+|---|---|---|
+| 0 / BEEP_2_CNT | 01 01 02 | Uninitialized stack byte in inspected caller |
+| 1 / BEEP_LONG | 00 05 01 | Uninitialized stack byte in inspected caller |
+
+Both send command 0x55 with 4 bytes via 0x4615B0 and return without waiting for
+an acknowledgement. General helper 0x461C90 takes a 16-bit value and an 8-bit value
+and serializes them little-endian into the first three bytes in the same layout.
+No calls selecting explicit red/green/off modes were located in the inspected
+executable. The command's BEEP_LED name alone does not prove LED control.
+
+`cyb_feedback_diagnostics.py` uses the two known first-three-byte patterns, with
+fourth byte deterministically zero; this is an explicit test assumption. It first
+records the user's autonomous baseline, then tests without any card present.
+Group 1: host-control baseline, double/long pattern, release baseline. Group 2:
+same without taking host control. Group 3: optional 01 01 01 00, 00 01 01 00,
+00 03 01 00 to distinguish count and duration hypotheses. No LED bit sweep or
+card operations are included. No command is retried on missing reply. Raw replies
+and physical observations are saved separately; USB write success is not physical
+confirmation. Public indication functions will not claim success until the
+sound/light behavior and parameter meanings are established.
