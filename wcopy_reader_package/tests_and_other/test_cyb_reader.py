@@ -217,6 +217,30 @@ class CybTests(unittest.TestCase):
             with self.assertRaises(error):self.run_device(d,lambda:r.write_card_number(123))
             self.assertEqual(sum(x[3]==0x6A for x in d.sent),1)
 
+    def test_windows_padded_write_count(self):
+        d = Device()
+        write = d.write
+        def windows_write(report):
+            write(report)
+            return 65  # hidapi/windows/hid.c returns padded OutputReportByteLength
+        d.write = windows_write
+        result = self.run_device(d, lambda:r.write_card_number(999))
+        self.assertEqual(result, 999)
+        self.assertEqual(sum(x[3] == 0x6A for x in d.sent), 1)
+        self.assertEqual(d.sent[0][6], 1)
+        self.assertEqual(d.sent[-1][6], 0)
+        self.assertTrue(d.closed)
+
+    def test_invalid_write_counts_are_not_accepted(self):
+        for count in (-1, 0, 8, 10, 64, 66):
+            with self.subTest(count=count):
+                d = Device()
+                d.write = lambda data: count
+                with self.assertRaises(r.USBError) as ctx:
+                    self.run_device(d)
+                self.assertIn(str(count), str(ctx.exception))
+                self.assertTrue(d.closed)
+
     def test_stale_frame_drained(self):
         d = Device(); d.queue = [frame(0x69,info(b'1234'))]
         self.assertEqual(self.run_device(d).uid, UID)

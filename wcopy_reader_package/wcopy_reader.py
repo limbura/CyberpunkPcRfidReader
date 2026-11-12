@@ -16,7 +16,7 @@ import logging
 import threading
 import time
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 VID, PID = 0x2518, 0x6018
 CYB_USB_IDS = ((0x0483, 0x4300), (0x0483, 0x4343))
 BLOCK = 1
@@ -434,8 +434,17 @@ class _CybSession(_Session):
         try:
             for start in range(0, len(packet), 64):
                 report = b"\0" + packet[start:start + 64]
-                if self.device.write(report) != len(report):
-                    raise USBError("Неполная передача Cyb по USB", stage=stage)
+                written = self.device.write(report)
+                _LOG.debug("%s CYB HID write requested=%d returned=%s report=%s",
+                           stage, len(report), written, report.hex(" "))
+                # Windows HIDAPI pads short writes to OutputReportByteLength
+                # and returns that padded count. Cyb uses 64-byte reports + ID.
+                # Keep the original short write; never resend an accepted command.
+                if written not in (len(report), 65):
+                    raise USBError(
+                        f"Некорректная передача Cyb по USB: отправлено {written}, "
+                        f"ожидалось {len(report)} или 65 с дополнением HIDAPI",
+                        stage=stage)
         except OSError as exc:
             raise USBError("Ошибка отправки команды Cyb", stage=stage) from exc
         deadline = time.monotonic() + self.timeout_ms / 1000

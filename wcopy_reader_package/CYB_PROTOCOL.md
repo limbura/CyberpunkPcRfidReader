@@ -52,7 +52,10 @@ Examples, excluding the USB report ID:
 
 A bounded input drain runs before each request. Unrelated valid notification
 frames are ignored while waiting under the same deadline. Malformed frames,
-short writes, timeouts and unexpected result sizes fail explicitly. Requests are
+short writes, timeouts and unexpected result sizes fail explicitly.
+For a short HID write, either the requested length or 65 is accepted: Windows
+HIDAPI zero-pads to OutputReportByteLength and returns the padded count. Other
+counts still fail; the command is never resent. Both counts are logged. Requests are
 never automatically retransmitted. A late response to an identical previous
 command cannot be distinguished perfectly without sequence IDs; keep exclusive
 access to the reader. USB reads and drains are bounded.
@@ -135,3 +138,21 @@ Then test a spare card with explicit --write and verify with the original app an
 if available, the old reader. Check both removal and reconnection, and existing
 application behavior. Fix protocol assumptions from actual captures before
 promoting this branch as confirmed support. LED/beep require a separate investigation.
+
+## First hardware diagnostic / Windows correction (1.5.1)
+
+The user's 2026-11-12 diagnostic (1.5.0) identified 0483:4343, interface 1,
+usage page 255, with all three expected descriptor strings. All three attempts
+stopped at the write-count check during initialize; no response was read.
+The old log omitted the returned count, so the precise value is not established.
+No card read/write command was reached.
+
+Inspection of HIDAPI 0.15.0 `windows/hid.c`, hid_write lines 1085–1107 and
+1120–1137, confirms zero-padding and returning the padded WriteFile count:
+https://github.com/libusb/hidapi/blob/hidapi-0.15.0/windows/hid.c
+
+The equality check was wrong for this Windows behavior. Version 1.5.1 accepts
+requested length or the known 65-byte report size and logs both values. Regression
+tests emulate a Windows backend returning 65 for every short write and ensure
+write/read-back/release work without resending the write. A repeat hardware
+run is still required; these logs did not yet validate the frame responses.
