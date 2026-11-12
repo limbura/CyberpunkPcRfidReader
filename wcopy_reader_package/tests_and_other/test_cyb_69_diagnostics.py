@@ -33,8 +33,8 @@ class Command69DiagnosticsTests(unittest.TestCase):
             device=lambda: device,
             enumerate=lambda vid, pid: [descriptor()] if (vid, pid) == (0x0483, 0x4300) else [])
         profiler = d.Profiler()
-        with patch.object(r, "_get_hid", return_value=fake), \\
-             patch.object(r, "_PERSISTENT_HOST_CONTROL", True), \\
+        with patch.object(r, "_get_hid", return_value=fake), \
+             patch.object(r, "_PERSISTENT_HOST_CONTROL", True), \
              contextlib.redirect_stdout(io.StringIO()), profiler.instrument():
             d.run_series(profiler, b"cyb", mode=mode, condition="held",
                          interval=0, count=3, timeout_ms=5, save=rows.append)
