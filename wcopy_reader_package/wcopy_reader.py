@@ -10,13 +10,14 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
 import importlib
 import logging
 import threading
 import time
 
-__version__ = "1.5.2"
+__version__ = "1.6.0"
 VID, PID = 0x2518, 0x6018
 CYB_USB_IDS = ((0x0483, 0x4300), (0x0483, 0x4343))
 BLOCK = 1
@@ -127,6 +128,8 @@ class CardData:
     block: bytes
     atqa: bytes
     sak: int
+    is_new: bool = field(default=False, compare=False)
+    presentation_id: int = field(default=0, compare=False)
 
     def to_int(self, *, offset: int = 8, length: int = 8,
                byteorder: str = "big") -> int:
@@ -138,6 +141,70 @@ class CardData:
     def number(self) -> int:
         """Последние 8 байт блока как unsigned big-endian (uint64)."""
         return self.to_int()
+
+
+@dataclass
+class _Presence:
+    uid: bytes | None = None
+    absent: int = 0
+    presentation_id: int = 0
+    feedback_retry_at: float = 0.0
+
+
+_PRESENCE: dict[bytes, _Presence] = {}
+_LAST_READER_PATH: bytes | None = None
+_PRESENTATION_SEQUENCE = 0
+_AUTO_SOUND = ContextVar("wcopy_auto_sound", default=True)
+
+
+def _record_card(state: _Presence, card: CardData) -> CardData:
+    global _PRESENTATION_SEQUENCE
+    is_new = state.uid != card.uid
+    if is_new:
+        _PRESENTATION_SEQUENCE += 1
+        state.presentation_id = _PRESENTATION_SEQUENCE
+    state.uid = card.uid
+    state.absent = 0
+    return replace(card, is_new=is_new, presentation_id=state.presentation_id)
+
+
+def is_card_removed(*, path: bytes | None = None) -> bool:
+    """Два последних опроса подтвердили отсутствие карты; USB не опрашивается.
+
+    Использовать после NoCardError для ожидания снятия. Ошибка обмена прерывает
+    последовательность отсутствий. Без path — состояние последнего выбранного
+    считывателя. До двух подтверждений возвращает False.
+    """
+    with _LOCK:
+        state = _PRESENCE.get(path if path is not None else _LAST_READER_PATH)
+        return state is not None and state.absent >= 2
+
+
+def _automatic_feedback(session, state, *, present: bool, new: bool = False,
+                        written: bool = False) -> None:
+    # Called only after successful card I/O or a confirmed NoCard response.
+    # Indication errors must never change the card operation's result.
+    if time.monotonic() < state.feedback_retry_at:
+        return
+    try:
+        if isinstance(session, _CybSession):
+            if written:
+                session.beep(t=5, count=2)
+            elif new and _AUTO_SOUND.get():
+                session.beep(t=5)
+        else:
+            session.set_led("green" if present else "red")
+            if written:
+                session.beep(t=10)
+        state.feedback_retry_at = 0.0
+    except RFIDError as error:
+        state.feedback_retry_at = time.monotonic() + 1.0
+        _LOG.warning("Автоматическая индикация не выполнена: %s", error)
+
+
+def _validate_auto_feedback(enabled: bool) -> None:
+    if type(enabled) is not bool:
+        raise ValueError("auto_feedback должен быть bool")
 
 
 def _get_hid():
@@ -583,16 +650,40 @@ class _CybSession(_Session):
         return tuple(replies)
 
 
-def read_card(*, path: bytes | None = None, timeout_ms: int = 2500) -> CardData:
+def read_card(*, path: bytes | None = None, timeout_ms: int = 2500,
+              auto_feedback: bool = True) -> CardData:
     """Однократно прочитать блок 1 ключом A=FF…FF; открыть/закрыть USB автоматически.
 
     path — из list_readers(); при None требуется ровно одно устройство.
     timeout_ms — ожидание одного HID-ответа, НЕ срок всей функции.
     Карта должна уже лежать на считывателе. Повторный вызов снова читает карту.
     Функция блокирующая. Вызовы этого модуля сериализуются внутри процесса.
+    is_new=True только для нового прикладывания; presentation_id стабилен до
+    смены UID или двух подряд NoCardError. Ошибки обмена не означают снятие.
+    auto_feedback=True: Cyb пищит один раз t=5 при новом прикладывании;
+    wCopy обновляет LED после чтения и NoCardError, отдельного писка нет.
+    False отключает автоматическую индикацию, но не отслеживание карты.
+    Самостоятельные звуки прошивки не отключаются. Сбои индикации журналируются.
     """
+    _validate_auto_feedback(auto_feedback)
     with _open_session(path, timeout_ms) as session:
-        return session.read()
+        state = session.presence
+        try:
+            card = session.read()
+        except NoCardError:
+            state.absent += 1
+            if state.absent >= 2:
+                state.uid = None
+            if auto_feedback:
+                _automatic_feedback(session, state, present=False)
+            raise
+        except RFIDError:
+            state.absent = 0
+            raise
+        card = _record_card(state, card)
+        if auto_feedback:
+            _automatic_feedback(session, state, present=True, new=card.is_new)
+        return card
 
 
 @contextmanager
@@ -601,16 +692,21 @@ def _open_session(path: bytes | None, timeout_ms: int, *, feedback: bool = False
         raise ValueError("timeout_ms должен быть целым числом от 1 до 60000")
     if path is not None and (not isinstance(path, bytes) or not path):
         raise ValueError("path должен быть непустым bytes из list_readers() либо None")
+    global _LAST_READER_PATH
     with _LOCK:
         hid = _get_hid()
         readers = _enumerate(hid)
         if path is not None:
             readers = tuple(r for r in readers if r.path == path)
         if not readers:
+            for state in _PRESENCE.values():
+                state.absent = 0
             raise ReaderNotFoundError("Поддерживаемый считыватель wCopy / Cyb не найден", stage="enumerate")
         if len(readers) != 1:
             raise MultipleReadersError("Найдено несколько считывателей; задайте path из list_readers()",
                                        stage="enumerate")
+        _LAST_READER_PATH = readers[0].path
+        state = _PRESENCE.setdefault(readers[0].path, _Presence())
         device = None
         primary_error = None
         yielded = False
@@ -623,6 +719,7 @@ def _open_session(path: bytes | None, timeout_ms: int, *, feedback: bool = False
                 raise ReaderOpenError("Не удалось открыть HID-интерфейс; возможно, он занят или отключён",
                                       stage="open") from exc
             session = (_CybSession if readers[0].backend == "cyb" else _Session)(device, timeout_ms)
+            session.presence = state
             try:
                 yielded = True
                 yield session
@@ -639,6 +736,8 @@ def _open_session(path: bytes | None, timeout_ms: int, *, feedback: bool = False
                         active_error.add_note(f"Не удалось вернуть автономный режим Cyb: {exc}")
         except BaseException as exc:
             primary_error = exc
+            if not isinstance(exc, NoCardError) and not feedback:
+                state.absent = 0
             if quiet and isinstance(exc, RFIDError):
                 _LOG.warning("Ошибка индикации Cyb: %s", exc)
                 if not yielded:
@@ -659,15 +758,17 @@ def _open_session(path: bytes | None, timeout_ms: int, *, feedback: bool = False
 
 
 def read_card_number(*, path: bytes | None = None, timeout_ms: int = 2500,
-                     offset: int = 8, length: int = 8, byteorder: str = "big") -> int:
+                     offset: int = 8, length: int = 8, byteorder: str = "big",
+                     auto_feedback: bool = True) -> int:
     """Вернуть беззнаковое число из блока 1. При ошибке поднять RFIDError.
 
     По умолчанию: последние 8 байт, big-endian (uint64). Ноль — корректное значение карты.
     Например, последние 4 байта: offset=12, length=4.
+    auto_feedback — автоматическая индикация и правила прикладывания read_card().
     Формат задаёт записывающее приложение; автоматически он не определяется.
     """
     _validate_format(offset, length, byteorder)
-    return read_card(path=path, timeout_ms=timeout_ms).to_int(
+    return read_card(path=path, timeout_ms=timeout_ms, auto_feedback=auto_feedback).to_int(
         offset=offset, length=length, byteorder=byteorder)
 
 
@@ -675,7 +776,8 @@ def write_card_number(number: int, *, path: bytes | None = None,
                       timeout_ms: int = 2500, offset: int = 8,
                       length: int = 8, byteorder: str = "big",
                       expected_uid: bytes | None = None,
-                      expected_block: bytes | None = None) -> int:
+                      expected_block: bytes | None = None,
+                      auto_feedback: bool = True) -> int:
     """Записать ID в блок 1 ключом A=FF…FF и обязательно проверить чтением.
 
     По умолчанию меняются байты 8..15 (uint64 big-endian); остальные сохраняются.
@@ -684,6 +786,11 @@ def write_card_number(number: int, *, path: bytes | None = None,
     RFIDError означает, что успех НЕ подтверждён; после команды write данные
     уже могли измениться. Автоматических повторов записи нет.
     Формат и диапазон проверяются до обращения к оборудованию.
+    auto_feedback=True: после проверки Cyb подаёт два коротких сигнала,
+    wCopy обновляет LED и подаёт один t=10. Внутренние чтения без сигналов.
+    False отключает автоматическую индикацию. Её сбой только журналируется.
+    Успешная запись помечает карту присутствующей, чтобы следующий опрос не
+    выдал дополнительный сигнал чтения той же карты.
     expected_uid / expected_block: при передаче сравниваются с начальным чтением
     в том же сеансе ДО команды записи. Несовпадение: VerificationError(stage="prewrite").
     """
@@ -694,11 +801,20 @@ def write_card_number(number: int, *, path: bytes | None = None,
         raise ValueError("expected_uid должен быть bytes длиной 4 или 7 либо None")
     if expected_block is not None and (not isinstance(expected_block, bytes) or len(expected_block) != 16):
         raise ValueError("expected_block должен быть bytes длиной 16 либо None")
+    _validate_auto_feedback(auto_feedback)
     encoded = number.to_bytes(length, byteorder, signed=False)
     with _open_session(path, timeout_ms) as session:
-        return session.write_number(encoded, offset, expected_uid=expected_uid,
-                                    expected_block=expected_block).to_int(
-            offset=offset, length=length, byteorder=byteorder)
+        try:
+            card = session.write_number(encoded, offset, expected_uid=expected_uid,
+                                        expected_block=expected_block)
+        except NoCardError:
+            # A failed write is not an additional removal poll.
+            session.presence.absent = 0
+            raise
+        _record_card(session.presence, card)
+        if auto_feedback:
+            _automatic_feedback(session, session.presence, present=True, written=True)
+        return card.to_int(offset=offset, length=length, byteorder=byteorder)
 
 
 def set_led(color: str, *, path: bytes | None = None, timeout_ms: int = 2500,
@@ -846,8 +962,8 @@ class CardState:
 def watch_cards(*, stop: threading.Event | None = None,
                 interval: float = 0.25, removal_checks: int = 2,
                 path: bytes | None = None, timeout_ms: int = 2500,
-                feedback: bool = False, sound: bool = True,
-                report_state: bool = False) -> Iterator[CardPresented | CardError | CardState]:
+                feedback: bool | None = None, sound: bool = True,
+                report_state: bool = False, auto_feedback: bool = True) -> Iterator[CardPresented | CardError | CardState]:
     """Блокирующий генератор CardPresented / CardError; см. README.
 
     Событие карты — только после успешного чтения. Повторы одного UID подавляются
@@ -855,14 +971,13 @@ def watch_cards(*, stop: threading.Event | None = None,
     USB-сбой, тайм-аут и ошибка ключа НЕ считаются снятием карты.
     stop.set() завершает цикл после текущей операции. Запускать в рабочем потоке.
     Исключения вызывающего кода не перехватываются.
-    feedback=True: команды для штатной индикации прошивки (не прямого цвета).
-    Ошибка индикации выдаётся отдельно и отключает индикацию до перезапуска
-    генератора; чтение продолжается. Удерживаемая карта повторно не пищит.
-    sound=False отключает только нашу команду писка, сохраняя команды LED.
-    На самостоятельные звуки прошивки этот параметр не влияет.
-    report_state=True добавляет CardState на каждом опросе для индикации
-    в приложении. По умолчанию команд LED/звука нет. feedback/sound сохранены
-    для совместимости; новым приложениям лучше вызывать set_led/beep самим.
+    auto_feedback=True использует автоматическую индикацию read_card.
+    feedback — прежний необязательный переключатель, при передаче имеет приоритет.
+    sound=False отключает отдельный писк чтения Cyb, сохраняя обновление LED
+    старого считывателя. Штатные звуки прошивки сохраняются. Ошибки индикации только журналируются.
+    report_state=True добавляет CardState на каждом опросе.
+    removal_checks задаёт подавление повторных событий этого генератора;
+    библиотечное состояние прикладывания использует два подтверждения снятия.
     """
     import math
     if not isinstance(interval, (int, float)) or not math.isfinite(interval) or interval <= 0:
@@ -873,7 +988,8 @@ def watch_cards(*, stop: threading.Event | None = None,
         raise ValueError("timeout_ms должен быть целым числом от 1 до 60000")
     if path is not None and (not isinstance(path, bytes) or not path):
         raise ValueError("path должен быть непустым bytes либо None")
-    if type(feedback) is not bool:
+    _validate_auto_feedback(auto_feedback)
+    if feedback is not None and type(feedback) is not bool:
         raise ValueError("feedback должен быть bool")
     if type(sound) is not bool:
         raise ValueError("sound должен быть bool")
@@ -883,36 +999,22 @@ def watch_cards(*, stop: threading.Event | None = None,
     last_uid = None
     absent = 0
     last_error = None
-    feedback_enabled = feedback
-
-    def update_feedback(color, beep=False):
-        nonlocal feedback_enabled
-        if not feedback_enabled:
-            return None
-        try:
-            set_reader_feedback(color, beep=beep, path=path, timeout_ms=timeout_ms)
-        except RFIDError as error:
-            feedback_enabled = False
-            failure = FeedbackError(
-                f"Индикация отключена до перезапуска наблюдения: {error}",
-                stage="feedback", status=error.status, response=error.response)
-            failure.__cause__ = error
-            return CardError(failure)
-        return None
+    enabled = auto_feedback if feedback is None else feedback
 
     while not stop.is_set():
         try:
-            card = read_card(path=path, timeout_ms=timeout_ms)
+            token = _AUTO_SOUND.set(sound)
+            try:
+                card = read_card(path=path, timeout_ms=timeout_ms, auto_feedback=enabled)
+            finally:
+                _AUTO_SOUND.reset(token)
         except NoCardError:
             absent += 1
             last_error = None
             if absent >= removal_checks:
                 last_uid = None
-            warning = update_feedback("green" if last_uid is not None else "red")
             if report_state:
                 yield CardState(last_uid is not None)
-            if warning is not None:
-                yield warning
         except RFIDError as error:
             absent = 0
             signature = (error.code, error.stage, error.status)
@@ -925,13 +1027,10 @@ def watch_cards(*, stop: threading.Event | None = None,
             absent = 0
             last_error = None
             is_new = card.uid != last_uid
-            warning = update_feedback("green", beep=is_new and sound)
             if report_state:
                 yield CardState(True, is_new)
             if is_new:
                 last_uid = card.uid
                 yield CardPresented(card)
-            if warning is not None:
-                yield warning
         if stop.wait(interval):
             break

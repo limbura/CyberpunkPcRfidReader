@@ -8,7 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from wcopy_reader import RFIDError, write_card_number, set_led, beep
 
-# Индикацией управляет этот пример, а не write_card_number().
+# Этот пример отключает автоматическую индикацию и демонстрирует ручной API.
 # Команда LED: None (не отправлять), "red", "green", "off".
 # Прямое управление цветом не подтверждено. После записи — отдельный beep().
 SUCCESS_LED = None
@@ -33,7 +33,7 @@ def main():
             raise ValueError("ID должен быть от 0 до 18446744073709551615")
         input(f"Приложите одну карту для записи ID {number} и нажмите Enter. "
               "Не убирайте карту до результата.")
-        verified = write_card_number(number)
+        verified = write_card_number(number, auto_feedback=False)
     except ValueError as error:
         print(f"Некорректный ID: {error}")
         return 2

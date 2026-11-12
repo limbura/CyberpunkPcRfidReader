@@ -79,6 +79,9 @@ class Device:
 
 
 class CybTests(unittest.TestCase):
+    def setUp(self):
+        r._PRESENCE.clear()
+
     def run_device(self, device, callback=None, descriptors=None):
         devices = descriptors if descriptors is not None else [descriptor()]
         fake = SimpleNamespace(device=lambda: device,
@@ -97,7 +100,7 @@ class CybTests(unittest.TestCase):
         card = self.run_device(d)
         self.assertEqual(card, r.CardData(UID, BLOCK, b'\0\4', 8))
         self.assertEqual(card.number, 513)
-        self.assertEqual([int.from_bytes(x[2:4], 'big') for x in d.sent], [0x51,0x69,0x6c,0x69,0x51])
+        self.assertEqual([int.from_bytes(x[2:4], 'big') for x in d.sent], [0x51,0x69,0x6c,0x69,0x55,0x51])
         self.assertEqual(d.sent[-1][6], 0)
         self.assertTrue(d.closed)
 

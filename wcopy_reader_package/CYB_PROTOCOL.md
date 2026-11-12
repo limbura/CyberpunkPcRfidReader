@@ -202,3 +202,17 @@ card operations are included. No command is retried on missing reply. Raw replie
 and physical observations are saved separately; USB write success is not physical
 confirmation. Public indication functions will not claim success until the
 sound/light behavior and parameter meanings are established.
+
+## Automatic feedback (1.6.0)
+
+Public read/write wrappers own automatic indication (default enabled;
+`auto_feedback=False` opts out). Internal session reads never indicate, so
+prewrite and verification reads cannot emit read beeps. Cyb read uses 01 01 01 00
+once per presentation; verified write uses 01 01 02 00. No periodic Cyb LED command.
+Legacy wCopy refreshes LED after successful/absent reads, and after verified write
+refreshes LED then beeps T=10. Automatic indication failures are logged separately.
+Host control still releases after every operation. Autonomous beeps remain.
+Presentation state is serialized with I/O, keyed by HID path, and rearms after
+changed UID or two consecutive absent responses. Errors interrupt absence counts.
+CardData exposes is_new and presentation_id; is_card_removed reads cached absence
+state for batch workflows. No card data is cached: every read still accesses USB.

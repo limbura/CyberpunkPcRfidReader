@@ -82,7 +82,7 @@ class IndicationAPITests(unittest.TestCase):
 
     def run_write(self, failure=None, beep_failure=None, args=()):
         order = []
-        def write(number):
+        def write(number, **kwargs):
             order.append('verified_write')
             if failure:
                 raise failure

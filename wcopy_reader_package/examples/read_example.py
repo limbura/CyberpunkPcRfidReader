@@ -27,7 +27,7 @@ def main():
         logging.basicConfig(level=logging.DEBUG, format="%(levelname)s %(message)s")
     input("Закройте nfcPro, положите одну карту на считыватель и нажмите Enter: ")
     try:
-        number = read_card_number()
+        number = read_card_number(auto_feedback=False)
     except NoCardError:
         print("Карта не обнаружена. Приложите карту и повторите запуск.")
     except AuthenticationError as exc:
