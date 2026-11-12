@@ -18,7 +18,7 @@ import logging
 import threading
 import time
 
-__version__ = "1.7.0"
+__version__ = "1.7.1"
 VID, PID = 0x2518, 0x6018
 CYB_USB_IDS = ((0x0483, 0x4300), (0x0483, 0x4343))
 BLOCK = 1
@@ -692,10 +692,6 @@ class _CybSession(_Session):
         if mask != 1:
             raise CardReadError("Cyb не прочитал блок 1; проверьте карту и ключ",
                                 stage="read", status=mask, response=body)
-        after_uid, after_atqa, after_sak = self._poll()
-        if (after_uid, after_atqa, after_sak) != (uid, atqa, sak):
-            raise VerificationError("Карта изменилась во время чтения Cyb",
-                                    stage="read", response=after_uid)
         return CardData(uid, body[4:], atqa, sak)
 
     def write_block(self, block: bytes) -> None:
@@ -749,6 +745,8 @@ def read_card(*, path: bytes | None = None, timeout_ms: int = 2500,
     False отключает автоматическую индикацию, но не отслеживание карты.
     По умолчанию Cyb сохраняет управление с ПК между операциями, подавляя
     автономный писк после первого захвата. Завершение — close_readers().
+    Cyb получает UID только перед чтением блока, без повторной проверки после.
+    При смене карты во время чтения UID и данные могут относиться к разным картам.
     Сбои индикации журналируются.
     """
     _validate_auto_feedback(auto_feedback)

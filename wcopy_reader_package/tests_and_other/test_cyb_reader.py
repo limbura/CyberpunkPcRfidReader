@@ -102,7 +102,7 @@ class CybTests(unittest.TestCase):
         card = self.run_device(d)
         self.assertEqual(card, r.CardData(UID, BLOCK, b'\0\4', 8))
         self.assertEqual(card.number, 513)
-        self.assertEqual([int.from_bytes(x[2:4], 'big') for x in d.sent], [0x51,0x69,0x6c,0x69,0x55])
+        self.assertEqual([int.from_bytes(x[2:4], 'big') for x in d.sent], [0x51,0x69,0x6c,0x55])
         self.assertFalse(any(x[2:4] == b'\0\x51' and x[6:-2] == b'\0' for x in d.sent))
         self.assertTrue(d.closed)
 
@@ -172,7 +172,7 @@ class CybTests(unittest.TestCase):
         with self.assertRaises(r.VerificationError) as ctx:self.run_device(d,lambda:r.write_card_number(123))
         self.assertEqual(ctx.exception.stage,'verify')
 
-    def test_uid_change_during_read(self):
+    def test_read_does_not_poll_uid_again(self):
         d=Device()
         write=d.write
         def changed(report):
@@ -180,7 +180,25 @@ class CybTests(unittest.TestCase):
             if report[3]==0x6C:d.uid=b'1234'
             return ret
         d.write=changed
-        with self.assertRaises(r.VerificationError):self.run_device(d)
+        card = self.run_device(d)
+        self.assertEqual(card.uid, UID)
+        self.assertEqual(card.block, BLOCK)
+        self.assertEqual(sum(x[3] == 0x69 for x in d.sent), 1)
+
+    def test_write_still_detects_changed_uid(self):
+        d = Device()
+        write = d.write
+        def changed(report):
+            result = write(report)
+            if report[3] == 0x6A:
+                d.uid = b'1234'
+            return result
+        d.write = changed
+        with self.assertRaises(r.VerificationError) as ctx:
+            self.run_device(d, lambda: r.write_card_number(999))
+        self.assertEqual(ctx.exception.stage, 'verify')
+        self.assertEqual(sum(x[3] == 0x69 for x in d.sent), 2)
+        self.assertEqual(d.reads, 2)
 
     def test_both_pids_and_descriptor_filter(self):
         for pid in (0x4300,0x4343):

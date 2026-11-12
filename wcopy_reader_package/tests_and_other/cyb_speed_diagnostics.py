@@ -107,7 +107,7 @@ def totals(row):
 
 
 def run_mode(profiler, path, mode, condition, count, timeout_ms, interval, save):
-    """No writes or indication; both UID polls remain in _CybSession.read()."""
+    """No writes or indication; uses the installed library read sequence."""
     def collect(action):
         for index in range(1, count+1):
             row = profiler.sample(action, mode=mode, condition=condition, index=index)
@@ -115,7 +115,7 @@ def run_mode(profiler, path, mode, condition, count, timeout_ms, interval, save)
             parts = totals(row)
             print(f"  {index}/{count}: {row['status']}, всего {row['total_ms']:.0f} мс; "
                   f"51={parts.get('initialize', 0):.0f}, поиск={parts.get('poll_1', 0):.0f}, "
-                  f"блок={parts.get('read', 0):.0f}, проверка UID={parts.get('poll_2', 0):.0f} мс")
+                  f"блок={parts.get('read', 0):.0f} мс")
             if row['status'] == 'error':
                 # Do not continue a retained session after a protocol/USB error.
                 print('  Ошибка:', row['code'], row['stage'], row['error'])
@@ -181,7 +181,7 @@ def main():
     path = None
     try:
         print('Закройте Master Manager, Cyb_Nfctool и другие программы считывателя.')
-        print('Скрипт только читает. Записи и звука нет. Проверки UID не отключаются.')
+        print('Скрипт только читает. Записи и звука нет. Используется процедура чтения установленной версии библиотеки.')
         readers = [x for x in r.list_readers() if x.backend == 'cyb']
         if not readers: raise RuntimeError('Подключённый Cyb не найден')
         for index, reader in enumerate(readers, 1):

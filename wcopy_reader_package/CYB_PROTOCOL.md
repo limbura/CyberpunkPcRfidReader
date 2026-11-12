@@ -100,9 +100,10 @@ DWARF typedef `iso14a_card_select_t` (CU 0xC5BACF):
 Only 4/7-byte UIDs and the existing Classic SAK allowlist are accepted. ATQA is
 reversed from presumed ISO14443A wire order to the existing PN-style API order;
 this byte-order normalization specifically requires hardware comparison.
-The library requests information before and after each block read to detect a
-card replacement. This cannot distinguish physically different cloned cards
-with identical UID/content, and it is not an atomic card-lock operation.
+Since 1.7.1 the library requests information only before each block read.
+It does not detect replacement during that read: UID and block data may refer
+to different cards. Writes still compare UID and all block bytes across the
+pre-write and post-write reads. This is not an atomic card-lock operation.
 
 ## Normal block read/write
 
