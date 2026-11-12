@@ -48,6 +48,8 @@ class Device:
         command = int.from_bytes(report[2:4], 'big')
         body = report[6:-2]
         assert report[1:] == frame(command, body)
+        if command == 0x55:
+            return len(report)
         if command == 0x51:
             result = body
         elif command == 0x69:
@@ -189,12 +191,52 @@ class CybTests(unittest.TestCase):
         d=Device();self.run_device(d,lambda:r.read_card(path=b'two'),readers)
         self.assertEqual(d.path,b'two')
 
-    def test_feedback_is_explicitly_unsupported(self):
-        for call in (r.beep, lambda:r.set_led('green'),lambda:r.set_reader_feedback('red',beep=True)):
-            d=Device()
-            with self.assertRaises(r.FeedbackError):self.run_device(d,call)
-            self.assertEqual(d.sent,[])
-            self.assertTrue(d.closed)
+    def test_feedback_payloads(self):
+        for call, payloads in (
+            (r.beep, ['01010100']),
+            (lambda: r.beep(t=6, count=3), ['01020300']),
+            (lambda: r.beep(t=1), ['01010100']),
+            (lambda: r.beep(t=255, count=999), ['01fbff00']),
+            (lambda: r.set_led('red'), ['00010100']),
+            (lambda: r.set_led('green'), ['00010100']),
+            (lambda: r.set_led('off'), ['00000000']),
+            (lambda: r.set_reader_feedback('green', beep=True, count=2),
+             ['00010100', '01010200']),
+        ):
+            with self.subTest(payloads=payloads):
+                d = Device()
+                result = self.run_device(d, call)
+                self.assertIn(result, (b'', (b'', b'')))
+                self.assertEqual([x[6:-2].hex() for x in d.sent], payloads)
+                self.assertTrue(all(x[2:4] == b'\0\x55' for x in d.sent))
+                self.assertTrue(d.closed)
+
+    def test_feedback_failures_do_not_escape(self):
+        for method in ('write', 'open_path', 'close'):
+            for call in (r.beep, lambda: r.set_led('green'),
+                         lambda: r.set_reader_feedback('red', beep=True)):
+                d = Device()
+                with patch.object(d, method, side_effect=OSError('disconnected')):
+                    self.assertIn(self.run_device(d, call), (b'', (), (b'', b'')))
+
+    def test_feedback_initialization_failure_is_suppressed_and_released(self):
+        d = Device(failures={0x51: frame(0x51, b'\x02')})
+        self.assertEqual(self.run_device(d, lambda: r.beep(initialize=True)), b'')
+        self.assertEqual([x[6:-2] for x in d.sent], [b'\1', b'\0'])
+        self.assertTrue(d.closed)
+
+    def test_feedback_count_validation(self):
+        for count in (0, -1, True, 1.5):
+            for call in (lambda: r.beep(count=count),
+                         lambda: r.set_reader_feedback('red', count=count)):
+                with self.assertRaises(ValueError):
+                    call()
+
+    def test_old_reader_ignores_count(self):
+        session = r._Session(Device(), 2500)
+        with patch.object(session, 'feedback_command', return_value=b'ok') as send:
+            self.assertEqual(session.beep(5, count=3), b'ok')
+            send.assert_called_once_with(bytes.fromhex('ff0040500405010101'))
 
     def test_mixed_readers_require_selection(self):
         old = dict(path=b'wcopy', vendor_id=r.VID, product_id=r.PID, interface_number=0)

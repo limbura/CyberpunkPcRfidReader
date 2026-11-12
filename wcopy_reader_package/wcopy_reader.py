@@ -16,7 +16,7 @@ import logging
 import threading
 import time
 
-__version__ = "1.5.1"
+__version__ = "1.5.2"
 VID, PID = 0x2518, 0x6018
 CYB_USB_IDS = ((0x0483, 0x4300), (0x0483, 0x4343))
 BLOCK = 1
@@ -291,14 +291,14 @@ class _Session:
         raise FeedbackError("Считыватель не подтвердил команду света/звука: " + body.hex(" "),
                             stage="feedback", response=body)
 
-    def feedback(self, color: str, beep: bool) -> tuple[bytes, ...]:
+    def feedback(self, color: str, beep: bool, count: int = 1) -> tuple[bytes, ...]:
         replies = []
         if beep:
-            replies.append(self.beep())
+            replies.append(self.beep(count=count))
         replies.append(self.set_led(color))
         return tuple(replies)
 
-    def beep(self, t: int = 5) -> bytes:
+    def beep(self, t: int = 5, count: int = 1) -> bytes:
         # Та же команда, которую формирует nfcPro_x64: FF 00 40 50 04 T 01 01 01.
         # T — значение поля команды, не миллисекунды. Цвет этим вызовом не задаём.
         _validate_beep_t(t)
@@ -556,14 +556,31 @@ class _CybSession(_Session):
             raise CardWriteError("Cyb не подтвердил запись блока 1", stage="write",
                                  status=mask, response=body)
 
-    def set_led(self, color: str) -> bytes:
-        raise FeedbackError("Управление LED Cyb пока не подтверждено; чтение/запись доступны",
-                            stage="feedback")
+    def _send_feedback(self, payload: bytes) -> bytes:
+        # CMD 55 has no acknowledgement. Do not wait or retry.
+        report = b"\0" + _cyb_request(0x55, payload)
+        _LOG.debug("feedback CYB TX %s", report.hex(" "))
+        try:
+            written = self.device.write(report)
+        except OSError as exc:
+            raise USBError("Ошибка отправки индикации Cyb", stage="feedback") from exc
+        if written not in (len(report), 65):
+            raise USBError("Неполная отправка индикации Cyb", stage="feedback")
+        return b""
 
-    def beep(self, t: int = 5) -> bytes:
-        _validate_beep_t(t)
-        raise FeedbackError("Управление пищалкой Cyb пока не подтверждено; чтение/запись доступны",
-                            stage="feedback")
+    def set_led(self, color: str) -> bytes:
+        return self._send_feedback(bytes.fromhex(
+            "00 00 00 00" if color == "off" else "00 01 01 00"))
+
+    def beep(self, t: int = 5, count: int = 1) -> bytes:
+        return self._send_feedback(bytes([1, max(1, t - 4), min(count, 255), 0]))
+
+    def feedback(self, color: str, beep: bool, count: int = 1) -> tuple[bytes, ...]:
+        # A later LED command can replace a running sound pattern.
+        replies = [self.set_led(color)]
+        if beep:
+            replies.append(self.beep(count=count))
+        return tuple(replies)
 
 
 def read_card(*, path: bytes | None = None, timeout_ms: int = 2500) -> CardData:
@@ -579,7 +596,7 @@ def read_card(*, path: bytes | None = None, timeout_ms: int = 2500) -> CardData:
 
 
 @contextmanager
-def _open_session(path: bytes | None, timeout_ms: int) -> Iterator[_Session]:
+def _open_session(path: bytes | None, timeout_ms: int, *, feedback: bool = False) -> Iterator[_Session | None]:
     if type(timeout_ms) is not int or not 1 <= timeout_ms <= 60000:
         raise ValueError("timeout_ms должен быть целым числом от 1 до 60000")
     if path is not None and (not isinstance(path, bytes) or not path):
@@ -596,6 +613,8 @@ def _open_session(path: bytes | None, timeout_ms: int) -> Iterator[_Session]:
                                        stage="enumerate")
         device = None
         primary_error = None
+        yielded = False
+        quiet = feedback and readers[0].backend == "cyb"
         try:
             try:
                 device = hid.device()
@@ -605,6 +624,7 @@ def _open_session(path: bytes | None, timeout_ms: int) -> Iterator[_Session]:
                                       stage="open") from exc
             session = (_CybSession if readers[0].backend == "cyb" else _Session)(device, timeout_ms)
             try:
+                yielded = True
                 yield session
             finally:
                 # Preserve the primary error if releasing host control also fails.
@@ -619,15 +639,23 @@ def _open_session(path: bytes | None, timeout_ms: int) -> Iterator[_Session]:
                         active_error.add_note(f"Не удалось вернуть автономный режим Cyb: {exc}")
         except BaseException as exc:
             primary_error = exc
-            raise
+            if quiet and isinstance(exc, RFIDError):
+                _LOG.warning("Ошибка индикации Cyb: %s", exc)
+                if not yielded:
+                    yield None
+            else:
+                raise
         finally:
             if device is not None:
                 try:
                     device.close()
                 except OSError as exc:
-                    if primary_error is None:
+                    if quiet:
+                        _LOG.warning("Ошибка закрытия HID после индикации Cyb: %s", exc)
+                    elif primary_error is None:
                         raise USBError("Ошибка закрытия HID-интерфейса", stage="close") from exc
-                    primary_error.add_note(f"Дополнительно не удалось закрыть HID: {exc}")
+                    elif primary_error is not None:
+                        primary_error.add_note(f"Дополнительно не удалось закрыть HID: {exc}")
 
 
 def read_card_number(*, path: bytes | None = None, timeout_ms: int = 2500,
@@ -677,6 +705,12 @@ def set_led(color: str, *, path: bytes | None = None, timeout_ms: int = 2500,
             initialize: bool = False) -> bytes:
     """Послать команду индикации red/green/off; вернуть сырой ответ.
 
+    Cyb: red и green отправляют 00 01 01 00 (включить красный LED без
+    звука), off — 00 00 00 00. Другие цвета аппаратно не подтверждены.
+    Ответа нет: возвращается b"". Ошибки USB/инициализации/закрытия для
+    выбранного Cyb только журналируются. Ошибки аргументов и выбора
+    устройства сохраняются. По умолчанию управление с ПК не включается.
+
     На NSR109-HIDIC V806N прямое задание цвета этими масками не подтверждено:
     red/green/off ведут себя одинаково. Однако вызов после КАЖДОГО опроса,
     включая «нет карты», нужен в проверенной схеме для штатного красного/
@@ -691,10 +725,18 @@ def set_led(color: str, *, path: bytes | None = None, timeout_ms: int = 2500,
         raise ValueError("color должен быть red, green или off")
     if type(initialize) is not bool:
         raise ValueError("initialize должен быть bool")
-    with _open_session(path, timeout_ms) as session:
+    with _open_session(path, timeout_ms, feedback=True) as session:
+        if session is None:
+            return b""
         if initialize:
             session.initialize()
         return session.set_led(color)
+    return b""
+
+
+def _validate_beep_count(count: int) -> None:
+    if type(count) is not int or count <= 0:
+        raise ValueError("count должен быть целым числом больше нуля")
 
 
 def _validate_beep_t(t: int) -> None:
@@ -702,11 +744,19 @@ def _validate_beep_t(t: int) -> None:
         raise ValueError("t должен быть целым числом от 1 до 255 (поле T, не миллисекунды)")
 
 
-def beep(*, t: int = 5, path: bytes | None = None, timeout_ms: int = 2500,
+def beep(*, t: int = 5, count: int = 1, path: bytes | None = None, timeout_ms: int = 2500,
          initialize: bool = False) -> bytes:
-    """Подать один сигнал командой nfcPro; вернуть сырой ответ.
+    """Подать звуковой сигнал (на Cyb — count сигналов).
 
-    t — сырое поле T (целое 1..255), НЕ миллисекунды. По умолчанию 5,
+    count — положительное целое, по умолчанию 1. Старый wCopy всегда
+    подаёт один сигнал независимо от count. Cyb использует min(count, 255).
+    Cyb: команда 01 B C 00, B=max(1, t-4), C=количество сигналов.
+    Таким образом t=1..5 даёт B=01, t=6 — 02, t=7 — 03.
+    Писк также меняет LED. Ответа нет: возвращается b"". Ошибки связи
+    с выбранным Cyb журналируются, не передаются приложению; ошибки
+    аргументов и выбора устройства сохраняются. По умолчанию без захвата ПК.
+
+    Для старого wCopy t — сырое поле T (целое 1..255), НЕ миллисекунды. По умолчанию 5,
     как в обычных вызовах nfcPro. Аппаратно проверены T=1,3,5,10; увеличение
     удлиняет писк. T=10 используется в write_example после проверки записи.
     Для больших T может потребоваться увеличить timeout_ms (например, 5000).
@@ -715,32 +765,50 @@ def beep(*, t: int = 5, path: bytes | None = None, timeout_ms: int = 2500,
     Не посылает команду установки цвета и не обращается к памяти карты.
     """
     _validate_beep_t(t)
+    _validate_beep_count(count)
     if type(initialize) is not bool:
         raise ValueError("initialize должен быть bool")
-    with _open_session(path, timeout_ms) as session:
+    with _open_session(path, timeout_ms, feedback=True) as session:
+        if session is None:
+            return b""
         if initialize:
             session.initialize()
-        return session.beep(t)
+        return session.beep(t, count=count)
+    return b""
 
 
-def set_reader_feedback(color: str, *, beep: bool = False, path: bytes | None = None,
+def set_reader_feedback(color: str, *, beep: bool = False, count: int = 1, path: bytes | None = None,
                         timeout_ms: int = 2500, initialize: bool = False) -> tuple[bytes, ...]:
     """Совместимый комбинированный вызов команд индикации.
 
-    color: red/green/off с ограничениями set_led (прямой цвет не подтверждён).
-    beep=True: один сигнал с T=5. Для выбора T используйте отдельный beep(t=...).
+    Cyb: red/green включают красный LED командой 00 01 01 00,
+    off выключает его командой 00 00 00 00. При beep=True после LED
+    отправляется 01 01 C 00; звук может снова включить LED даже при off.
+    Такой порядок предотвращает отмену звука следующей командой LED.
+    count — положительное целое, по умолчанию 1; Cyb ограничивает его 255,
+    старый wCopy всегда использует 1. Возврат Cyb: (b"",) или (b"", b"").
+    Ошибки связи с выбранным Cyb журналируются; при сбое отправки/инициализации
+    возврат (). Сбой закрытия не меняет уже полученный результат.
+    Ошибки аргументов и выбора устройства сохраняются.
+
+    Для wCopy color: red/green/off с ограничениями set_led (цвет не подтверждён).
+    beep=True использует T=5. Для другого T используйте отдельный beep(t=...).
     Возвращает ответы устройства: подтверждение команды не доказывает цвет/звук.
     initialize=True для самостоятельного теста, False после чтения в watch.
     Не отправляет команд чтения/записи памяти карты.
     """
     if color not in ("red", "green", "off"):
         raise ValueError("color должен быть red, green или off")
+    _validate_beep_count(count)
     if type(beep) is not bool or type(initialize) is not bool:
         raise ValueError("beep и initialize должны быть bool")
-    with _open_session(path, timeout_ms) as session:
+    with _open_session(path, timeout_ms, feedback=True) as session:
+        if session is None:
+            return ()
         if initialize:
             session.initialize()
-        return session.feedback(color, beep)
+        return session.feedback(color, beep, count=count)
+    return ()
 
 
 @dataclass(frozen=True)

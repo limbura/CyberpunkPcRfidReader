@@ -122,14 +122,24 @@ sends one write command, and then performs fresh information/block requests.
 All 16 bytes and UID must match. Cyb uses native operations; it does not send the
 old PN RF-reset commands. Cache/RF behavior must be verified on hardware.
 
-## Indication: intentionally incomplete
+## Indication (1.5.2)
 
-DWARF names command 0x55 `CMD_SYS_DEV_BEEP_LED_SET`. Functions 0x461C90 and
-0x461CC0 send four payload bytes; the last byte appears uninitialized, and the
-meaning/units of the other fields are insufficiently established to implement
-compatible arbitrary LED colors and beep(t). No guessed indication packets are
-sent. Public indication calls raise FeedbackError. Read/write and watch_cards()
-without feedback remain usable. Existing wCopy indication code is unchanged.
+Command 0x55 takes A B C D and sends no acknowledgement. User hardware
+experiments establish A as the pause between signals (03 vs 0F increases it),
+B as sound duration, C as count. A=0 merges audible pulses. Units are unknown.
+D has no observed effect in tested values 00/01/04; always transmit zero.
+
+beep(t, count) sends 01 max(1,t-4) min(count,255) 00. count must be a positive
+integer; legacy wCopy ignores count and still sends one signal.
+red/green send 00 01 01 00 (silent red LED on); off sends 00 00 00 00.
+Combined feedback sends LED first, sound second, to avoid cancelling sound;
+the sound pattern may turn LED back on even when color=off.
+No host takeover by default for indication. Explicit initialize=True still
+releases host control on exit. Selected Cyb indication I/O failures are logged
+and suppressed, while argument/discovery errors and card-operation errors remain
+visible. No retry and no fabricated acknowledgement: return empty bytes.
+These mappings are based on manual hardware observations; the integrated API
+still needs a hardware smoke test. Existing wCopy packets remain unchanged.
 
 ## Hardware acceptance
 
@@ -138,7 +148,7 @@ no-card behavior, UID/ATQA/SAK, block 1 and number against the original applicat
 Then test a spare card with explicit --write and verify with the original app and,
 if available, the old reader. Check both removal and reconnection, and existing
 application behavior. Fix protocol assumptions from actual captures before
-promoting this branch as confirmed support. LED/beep require a separate investigation.
+promoting this branch as confirmed support. Exercise LED/beep separately after card verification.
 
 ## First hardware diagnostic / Windows correction (1.5.1)
 

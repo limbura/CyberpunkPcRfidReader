@@ -13,7 +13,7 @@ class IndicationAPITests(unittest.TestCase):
     def test_independent_public_commands(self):
         session = r._Session(None, 2500)
         @contextmanager
-        def opened(*args):
+        def opened(*args, **kwargs):
             yield session
         with patch.object(r, '_open_session', opened), \
                 patch.object(session, 'exchange', return_value=b'\x90\x01') as exchange:
@@ -28,7 +28,7 @@ class IndicationAPITests(unittest.TestCase):
     def test_beep_duration_forwarded_with_initialize_and_response(self):
         session = r._Session(None, 5000)
         @contextmanager
-        def opened(*args):
+        def opened(*args, **kwargs):
             yield session
         with patch.object(r, '_open_session', opened), \
                 patch.object(session, 'exchange', return_value=b'\x90\x01') as exchange, \
