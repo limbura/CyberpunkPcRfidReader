@@ -197,6 +197,7 @@ Cyb по умолчанию удерживает режим управления
 CyberpunkPcRfidReader/
 ├── README.md                         # Это руководство
 ├── .github/workflows/reader-tests.yml # CI: Linux и Windows
+├── .github/workflows/release.yml      # Релиз по тегу vX.Y.Z
 ├── wcopy_reader_package/
 │   ├── wcopy_reader.py               # Весь публичный API и оба HID-бэкенда
 │   ├── requirements.txt              # hidapi
@@ -209,6 +210,7 @@ CyberpunkPcRfidReader/
 │   ├── CYB_PROTOCOL.md               # Описание протокола Cyb
 │   ├── CYB_PERFORMANCE.md            # Данные и инструменты диагностики
 │   └── PERSISTENT_CONTROL_CHECKLIST.md
+├── scripts/build_release.py          # Проверка версии, сборка ZIP + SHA-256
 ├── raw_test_scripts/                 # Низкоуровневые вспомогательные скрипты
 └── original_exe/                     # Оригинальные сторонние программы
 ```
@@ -224,3 +226,34 @@ python -m unittest discover -s tests_and_other -p "test_*.py" -v
 ```
 
 Тесты используют имитацию HID-считывателей; реальное USB-устройство для них не требуется. На GitHub Actions эта же проверка и проверка синтаксиса запускаются на **Ubuntu / Python 3.11** и **Windows / Python 3.13** при коммитах в `master`, pull request в `master` и при ручном запуске. Успешные тесты не заменяют аппаратную проверку конкретных карт и считывателя.
+
+
+## Автоматическое создание GitHub Release
+
+Workflow [release.yml](.github/workflows/release.yml) запускается при отправке нового тега вида **`vX.Y.Z`**. Тег должен совпадать с константой `__version__` в `wcopy_reader_package/wcopy_reader.py`, а помеченный коммит должен принадлежать истории `master`. Несовпадение останавливает выпуск.
+
+Перед публикацией выполняются тесты и проверка синтаксиса на **Ubuntu / Python 3.11** и **Windows / Python 3.13**. Только после их успешного завершения создаётся GitHub Release с автоматически сформированными заметками и двумя вложениями:
+
+- `wcopy_reader_package_vX.Y.Z.zip` — библиотека `wcopy_reader.py`, `requirements.txt`, актуальный README, описание обоих протоколов и три примера из `examples/`. Внутри ZIP сохраняется каталог `wcopy_reader_package_vX.Y.Z/`.
+- `wcopy_reader_package_vX.Y.Z.sha256` — контрольная сумма архива.
+
+Архив **не содержит** оригинальные сторонние EXE, низкоуровневые утилиты, тесты или диагностические журналы. Это исходный Python-модуль с зависимостью `hidapi`, а не автономный Windows EXE.
+
+Для выпуска новой версии обновите `__version__` в исходном файле и отправьте тег из актуального `master`:
+
+```powershell
+git switch master
+git pull --ff-only origin master
+git tag v1.8.0
+git push origin v1.8.0
+```
+
+В примере указан тег для версии `1.8.0`; для следующего выпуска используйте соответствующий **новый** номер версии. Создавать тег, который уже существует, повторно не нужно. Публикация начинается только после отправки тега; обычный push в `master` релиз не создаёт.
+
+Локально проверить состав архива (без публикации) можно так:
+
+```powershell
+python scripts/build_release.py --tag v1.8.0
+```
+
+Готовые файлы появятся в каталоге `dist/`. Для создания GitHub Release локальный запуск не требуется.
