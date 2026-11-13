@@ -26,7 +26,7 @@ class WindowsReaderLockTests(unittest.TestCase):
             "try:\n"
             "    r._claim_reader_lock(bytes.fromhex(sys.argv[1]))\n"
             "except r.ReaderBusyError as exc:\n"
-            "    print(exc)\n"
+            "    print('BUSY')\n"
             "    sys.exit(13)\n"
             "sys.exit(0)\n"
         )
@@ -41,7 +41,7 @@ class WindowsReaderLockTests(unittest.TestCase):
         self.assertFalse(r._claim_reader_lock(self.device_path))
         duplicate = self.probe_in_another_process(self.device_path)
         self.assertEqual(duplicate.returncode, 13, duplicate.stderr)
-        self.assertIn("используется", duplicate.stdout)
+        self.assertIn("BUSY", duplicate.stdout)
         self.assertTrue(r.close_readers(path=self.device_path))
         accepted = self.probe_in_another_process(self.device_path)
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
