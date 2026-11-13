@@ -55,15 +55,29 @@ class Device:
         elif command == 0x69:
             result = info(self.uid)
         elif command in (0x6C, 0x6A):
-            assert body[:15] == b'\x01\x01\x00' + b'\xff'*12
             if command == 0x6A:
+                assert body[:15] == b'\x01\x01\x00' + b'\xff'*12
                 assert len(body) == 31
                 self.block = body[15:]
                 result = b'\0\0\0\1'
             else:
-                assert len(body) == 15
+                assert len(body) == 15 and body[3:] == b'\xff'*12
                 self.reads += 1
-                result = b'\0\0\0\1' + self.block
+                start, count, mode = body[:3]
+                assert mode == 0
+                if len(self.uid) == 4:
+                    bcc = self.uid[0] ^ self.uid[1] ^ self.uid[2] ^ self.uid[3]
+                    block0 = self.uid + bytes([bcc]) + b'\0'*11
+                else:
+                    block0 = self.uid.ljust(16, b'\0')
+                if (start, count) == (0, 2):
+                    result = b'\0\0\0\3' + block0 + self.block
+                elif (start, count) == (1, 1):
+                    result = b'\0\0\0\1' + self.block
+                elif (start, count) == (0, 1):
+                    result = b'\0\0\0\1' + block0
+                else:
+                    raise AssertionError((start, count))
         else:
             raise AssertionError(command)
         response = self.failures.get(command, frame(command, result))
@@ -100,9 +114,12 @@ class CybTests(unittest.TestCase):
     def test_read_keeps_host_mode_and_closes_usb(self):
         d = Device()
         card = self.run_device(d)
-        self.assertEqual(card, r.CardData(UID, BLOCK, b'\0\4', 8))
+        self.assertEqual(card, r.CardData(UID, BLOCK, b'\0\0', 0))
         self.assertEqual(card.number, 513)
-        self.assertEqual([int.from_bytes(x[2:4], 'big') for x in d.sent], [0x51,0x69,0x6c,0x55])
+        self.assertEqual([int.from_bytes(x[2:4], 'big') for x in d.sent], [0x51,0x6c,0x55])
+        reads = [p for p in d.sent if p[3] == 0x6C]
+        self.assertEqual(len(reads), 1)
+        self.assertEqual(reads[0][6:9], b'\x00\x02\x00')
         self.assertFalse(any(x[2:4] == b'\0\x51' and x[6:-2] == b'\0' for x in d.sent))
         self.assertTrue(d.closed)
 
@@ -111,15 +128,19 @@ class CybTests(unittest.TestCase):
 
     def test_padded_and_report_id(self):
         for n, prefix in [(64,b''), (64,b'\0')]:
-            raw = prefix + frame(0x6C, b'\0\0\0\1' + BLOCK).ljust(n, b'\0')
+            bcc = UID[0] ^ UID[1] ^ UID[2] ^ UID[3]
+            raw = prefix + frame(0x6C, b'\0\0\0\3' + UID + bytes([bcc]) +
+                                 b'\0'*11 + BLOCK).ljust(n, b'\0')
             self.assertEqual(self.run_device(Device(failures={0x6C:raw})).number, 513)
 
     def test_unsolicited_frame(self):
-        response = frame(0x1234,b'notification') + frame(0x6C,b'\0\0\0\1' + BLOCK)
+        bcc = UID[0] ^ UID[1] ^ UID[2] ^ UID[3]
+        response = (frame(0x1234,b'notification') +
+                    frame(0x6C, b'\0\0\0\3' + UID + bytes([bcc]) + b'\0'*11 + BLOCK))
         self.assertEqual(self.run_device(Device(failures={0x6C:response})).number, 513)
 
     def test_empty_reader(self):
-        d = Device(failures={0x69:frame(0x69,b'\0'*19)})
+        d = Device(failures={0x6C:frame(0x6C,b'\0'*36)})
         with self.assertRaises(r.NoCardError): self.run_device(d)
         self.assertTrue(d.closed)
         self.assertFalse(any(x[2:4] == b'\0\x51' and x[6:-2] == b'\0' for x in d.sent))
@@ -131,8 +152,10 @@ class CybTests(unittest.TestCase):
             (b'\x55\0\x6c\xff\xff',r.ProtocolError),
             (b'garbage',r.ProtocolError),
             (frame(0x6C,b'\0\0\0\1'+BLOCK)[:-1]+b'\xff',r.ProtocolError),
-            (frame(0x6C,b'\0'*4+BLOCK),r.CardReadError),
+            (frame(0x6C,b'\0'*4+BLOCK),r.NoCardError),
             (frame(0x6C,b'\0\0\0\1'),r.ProtocolError),
+            (frame(0x6C,b'\0\0\0\1'+bytes(32)),r.CardReadError),
+            (frame(0x6C,b'\0\0\0\3'+bytes(32)),r.UnsupportedCardError),
         ]:
             with self.subTest(reply=reply):
                 d=Device(failures={0x6C:reply})
@@ -183,7 +206,8 @@ class CybTests(unittest.TestCase):
         card = self.run_device(d)
         self.assertEqual(card.uid, UID)
         self.assertEqual(card.block, BLOCK)
-        self.assertEqual(sum(x[3] == 0x69 for x in d.sent), 1)
+        self.assertEqual(sum(x[3] == 0x69 for x in d.sent), 0)
+        self.assertEqual(sum(x[3] == 0x6C for x in d.sent), 1)
 
     def test_write_still_detects_changed_uid(self):
         d = Device()
@@ -269,12 +293,19 @@ class CybTests(unittest.TestCase):
         self.assertEqual(self.run_device(d, lambda:r.read_card_number(path=b'cyb'),
                                         [old, descriptor()]), 513)
 
-    def test_uid_seven_bytes_and_unsupported_card(self):
+    def test_fast_read_rejects_unverified_uid_but_write_keeps_7_byte_support(self):
         d = Device(); d.uid = b'1234567'
-        self.assertEqual(self.run_device(d).uid, d.uid)
+        with self.assertRaises(r.UnsupportedCardError):
+            self.run_device(d)
+        d = Device(); d.uid = b'1234567'
+        self.assertEqual(self.run_device(
+            d, lambda: r.write_card_number(123)).__class__, int)
+        self.assertEqual([p[3] for p in d.sent].count(0x69), 2)
         bad = bytearray(info()); bad[15] = 0
         with self.assertRaises(r.UnsupportedCardError):
-            self.run_device(Device(failures={0x69:frame(0x69,bytes(bad))}))
+            self.run_device(
+                Device(failures={0x69:frame(0x69,bytes(bad))}),
+                lambda: r.write_card_number(123))
 
     def test_write_rejected_and_malformed(self):
         for body, error in [(b'\0'*4, r.CardWriteError), (b'\1', r.ProtocolError)]:
@@ -322,7 +353,7 @@ class CybTests(unittest.TestCase):
         self.assertEqual(event.number,513)
 
     def test_release_error_does_not_hide_primary_error(self):
-        d=Device(failures={0x69:frame(0x69,b'\0'*19)})
+        d=Device(failures={0x6C:frame(0x6C,b'\0'*36)})
         write=d.write
         def fail_release(report):
             if report[3]==0x51 and report[6]==0:raise OSError('unplugged')
