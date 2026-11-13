@@ -124,11 +124,34 @@ Read response: 4-byte big-endian success bitmask followed by 16 bytes per block.
 Write response: 4-byte big-endian success bitmask. For one block success is 1;
 other masks fail. This follows 0x491E50 and callers testing individual bits.
 
-Only block 1 is accessed. The shared write procedure preserves bytes outside
-the requested slice, compares optional expected_uid/expected_block before writing,
-sends one write command, and then performs fresh information/block requests.
-All 16 bytes and UID must match. Cyb uses native operations; it does not send the
-old PN RF-reset commands. Cache/RF behavior must be verified on hardware.
+Since v1.8.0 ordinary Cyb reads use exactly one native 0x6C request
+with start_block=0, block_count=2, mode=0, both keys FF..FF.
+Response has 4-byte success bitmask 0x00000003 and 32 bytes of data:
+manufacturer block 0 followed by user block 1. Block 0 bytes 0..3 are
+the 4-byte UID; byte 4 must match XOR(UID[0:4]), used as a guard
+against misinterpreting incompatible manufacturer layouts / 7-byte UIDs.
+The UID and user block were cross-checked on real hardware against a
+separate 0x69 (both cards A/B matched) in November 2026.
+0x69 is NEVER called in the normal Cyb read path.
+
+ATQA and SAK cannot be measured from manufacturer memory. Fast reads keep
+the CardData fields and types unchanged but use b"\\x00\\x00" for ATQA and 0
+for SAK, explicitly indicating unavailable RF metadata (not observed 0x0000/0).
+Only 4-byte UID cards with BCC were validated; unsupported layouts fail
+as UnsupportedCardError. When mask=0, the fast path raises NoCardError
+for background-poll compatibility, even though the device cannot
+differentiate empty field, authentication error, or inaccessible cards.
+Partial success (mask 1/2) raises CardReadError; malformed replies raise
+ProtocolError.
+
+**Write workflow remains exactly as before** via the private
+_read_for_write() hook. It performs
+0x69 -> 0x6C(start=1,count=1) -> 0x6A(start=1,count=1) ->
+0x69 -> 0x6C(start=1,count=1), retaining expected_uid, expected_block,
+full-block and post-write UID checks. The old wCopy/PN code path uses
+the same read()/write_number() behavior as before.
+Cyb does not send the old PN RF-reset commands. A two-block response
+is one HID command, not a formally guaranteed atomic RF operation.
 
 ## Indication (1.5.2)
 
