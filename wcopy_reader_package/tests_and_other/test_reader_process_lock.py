@@ -51,6 +51,25 @@ class WindowsReaderLockTests(unittest.TestCase):
         other_path = b"other-" + self.device_path
         self.assertEqual(self.probe_in_another_process(other_path).returncode, 0)
 
+    def test_reserve_reader_claims_without_opening_hid(self):
+        device = SimpleNamespace(open_path=lambda path: self.fail("reservation must not open HID"))
+        hid = SimpleNamespace(
+            device=lambda: device,
+            enumerate=lambda vid, pid: ([dict(path=self.device_path,
+                vendor_id=vid, product_id=pid, interface_number=0)]
+                if (vid, pid) == (r.VID, r.PID) else []))
+        with patch.object(r, "_get_hid", return_value=hid):
+            self.assertTrue(r.reserve_reader())
+            self.assertTrue(r.reserve_reader())
+        self.assertEqual(self.probe_in_another_process(self.device_path).returncode, 13)
+
+    def test_reserve_reader_without_connected_device_does_not_lock(self):
+        hid = SimpleNamespace(enumerate=lambda vid, pid: [])
+        with patch.object(r, "_get_hid", return_value=hid):
+            with self.assertRaises(r.ReaderNotFoundError):
+                r.reserve_reader()
+        self.assertNotIn(self.device_path, r._READER_LOCKS)
+
     def test_busy_reader_never_opens_hid_or_sends_commands(self):
         device = SimpleNamespace(open_path=lambda path: self.fail("USB must not be opened"))
         hid = SimpleNamespace(
