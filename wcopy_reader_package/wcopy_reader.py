@@ -23,7 +23,7 @@ import time
 if os.name == "nt":
     import msvcrt  # Standard Windows library; no extra dependencies.
 
-__version__ = "1.8.2"
+__version__ = "1.8.0"
 VID, PID = 0x2518, 0x6018
 CYB_USB_IDS = ((0x0483, 0x4300), (0x0483, 0x4343))
 BLOCK = 1
