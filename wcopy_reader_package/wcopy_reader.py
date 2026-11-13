@@ -18,7 +18,7 @@ import logging
 import threading
 import time
 
-__version__ = "1.8.0"
+__version__ = "1.8.1"
 VID, PID = 0x2518, 0x6018
 CYB_USB_IDS = ((0x0483, 0x4300), (0x0483, 0x4343))
 BLOCK = 1
@@ -693,23 +693,31 @@ class _CybSession(_Session):
     def read(self) -> CardData:
         """Fast Cyb read: UID and game ID in a single 0x6C(0,2), no 0x69."""
         self.initialize()
-        body = self.exchange_cyb(0x6C, self._fast_read_parameters(), "read")
-        if len(body) < 4:
-            raise ProtocolError("Нет маски результатов чтения блоков 0 и 1 Cyb",
-                                stage="read", response=body)
-        mask = int.from_bytes(body[:4], "big")
-        # A failed read can also mean wrong keys or an unsupported card;
-        # 0x6C provides no dedicated no-card status. Match polling semantics
-        # for background scanning without changing the public API.
-        if mask == 0 and len(body) in (4, 20, 36):
-            raise NoCardError("Cyb: карта отсутствует или оба блока недоступны",
-                              stage="read", status=mask, response=body)
-        if len(body) != 36:
-            raise ProtocolError("Ожидались маска и 32 байта блоков 0 и 1 Cyb",
-                                stage="read", response=body)
-        if mask != 3:
-            raise CardReadError("Cyb не прочитал оба блока 0 и 1",
-                                stage="read", status=mask, response=body)
+        # A partially coupled card can yield only one of the two blocks.
+        # Retry READ ONLY, at most twice, without resetting presence/UID state.
+        # Successful reads keep the single-command fast path.
+        for attempt in range(3):
+            body = self.exchange_cyb(0x6C, self._fast_read_parameters(), "read")
+            if len(body) < 4:
+                raise ProtocolError("Нет маски результатов чтения блоков 0 и 1 Cyb",
+                                    stage="read", response=body)
+            mask = int.from_bytes(body[:4], "big")
+            # A failed read can also mean wrong keys or an unsupported card;
+            # 0x6C provides no dedicated no-card status.
+            if mask == 0 and len(body) in (4, 20, 36):
+                raise NoCardError("Cyb: карта отсутствует или оба блока недоступны",
+                                  stage="read", status=mask, response=body)
+            if len(body) != 36:
+                raise ProtocolError("Ожидались маска и 32 байта блоков 0 и 1 Cyb",
+                                    stage="read", response=body)
+            if mask == 3:
+                break
+            if mask not in (1, 2) or attempt == 2:
+                raise CardReadError("Cyb не прочитал оба блока 0 и 1",
+                                    stage="read", status=mask, response=body)
+            _LOG.debug("Cyb: частичное чтение mask=0x%02X, повтор %d/2",
+                       mask, attempt + 1)
+            time.sleep(0.05)
         manufacturer = body[4:20]
         # The game fleet uses 4-byte UIDs. BCC at byte 4 is the XOR of
         # UID[0:4]. Fail closed instead of silently interpreting a 7-byte UID
