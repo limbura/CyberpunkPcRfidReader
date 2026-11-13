@@ -13,10 +13,15 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 import atexit
+import hashlib
 import importlib
 import logging
+import os
 import threading
 import time
+
+if os.name == "nt":
+    import msvcrt  # Standard Windows library; no extra dependencies.
 
 __version__ = "1.8.1"
 VID, PID = 0x2518, 0x6018
@@ -54,6 +59,16 @@ class MultipleReadersError(RFIDError):
 
 class ReaderOpenError(RFIDError):
     code = "READER_OPEN_ERROR"
+
+
+class ReaderBusyError(RFIDError):
+    """Another cooperative process holds this reader's Windows lock."""
+    code = "READER_BUSY"
+
+
+class ReaderLockError(RFIDError):
+    """The locking facility itself could not be used."""
+    code = "READER_LOCK_ERROR"
 
 
 class USBError(RFIDError):
@@ -162,6 +177,75 @@ _PERSISTENT_HOST_CONTROL = True
 # Only devices this process attempted to take over; never release unrelated readers.
 _OWNED_CYB: dict[bytes, int] = {}
 
+# File handles deliberately outlive individual HID sessions. On Windows,
+# closing the handle (including on process termination) releases the byte lock.
+# Every access is protected by the existing module-wide _LOCK.
+_READER_LOCKS: dict[bytes, object] = {}
+
+
+def _reader_lock_filename(device_path: bytes) -> str:
+    base = os.environ.get("LOCALAPPDATA") or os.path.join(
+        os.path.expanduser("~"), "AppData", "Local")
+    name = hashlib.sha256(device_path).hexdigest() + ".lock"
+    return os.path.join(base, "CyberpunkRfidReader", "locks", name)
+
+
+def _claim_reader_lock(device_path: bytes) -> bool:
+    """Claim this reader across cooperating Windows processes; False if already ours.
+
+    No HID command is sent until the claim succeeds. Linux/macOS keep their
+    existing behavior; the msvcrt guard is Windows-only.
+    """
+    if os.name != "nt" or device_path in _READER_LOCKS:
+        return False
+    filename = _reader_lock_filename(device_path)
+    try:
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        handle = open(filename, "a+b")
+    except OSError as exc:
+        raise ReaderLockError(
+            "Не удалось создать блокировку считывателя. Проверьте права доступа "
+            "к папке LOCALAPPDATA.", stage="lock") from exc
+    try:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError as exc:
+        handle.close()
+        # msvcrt reports a conflicting byte-range lock as errno=EACCES.
+        # A failure to create/open the lock file is handled separately above.
+        if exc.errno == 13 or getattr(exc, "winerror", None) in (32, 33):
+            raise ReaderBusyError(
+                "Считыватель уже используется другой программой Cyberpunk "
+                "(например, другим Master Manager или Change ID). "
+                "Закройте её и повторите попытку.", stage="lock") from exc
+        raise ReaderLockError(
+            "Не удалось проверить блокировку считывателя (ошибка Windows).",
+            stage="lock") from exc
+    _READER_LOCKS[device_path] = handle
+    return True
+
+
+def _release_reader_locks(path: bytes | None = None) -> bool:
+    """Release our lock(s); never delete the common lock files."""
+    ok = True
+    for device_path, handle in list(_READER_LOCKS.items()):
+        if path is not None and device_path != path:
+            continue
+        del _READER_LOCKS[device_path]
+        try:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError as exc:
+            ok = False
+            _LOG.warning("Не удалось снять блокировку считывателя: %s", exc)
+        finally:
+            try:
+                handle.close()
+            except OSError as exc:
+                ok = False
+                _LOG.warning("Не удалось закрыть файл блокировки считывателя: %s", exc)
+    return ok
+
 
 def _release_readers_locked(path: bytes | None = None) -> bool:
     selected = [(p, timeout) for p, timeout in _OWNED_CYB.items()
@@ -203,21 +287,21 @@ def _release_readers_locked(path: bytes | None = None) -> bool:
 
 
 def close_readers(*, path: bytes | None = None) -> bool:
-    """Вернуть захваченные этим процессом Cyb в автономный режим.
+    """Завершить работу с устройствами: освободить Cyb и Windows-блокировки.
 
-    Дожидается текущей операции под общей блокировкой. Сначала остановите свой
-    цикл опроса. Без path освобождает все использованные Cyb, с path — один.
-    Возвращает True при успехе (включая отсутствие захватов); сбои журналируются
-    и возвращают False, не отменяя результатов чтения/записи. Вызов повторяемый.
-    Последующий read/write снова включит управление с ПК.
-    Автоматически вызывается через atexit при обычном завершении Python.
-    При принудительном убийстве процесса atexit не гарантируется; переподключите
-    USB для аппаратного сброса. Старые wCopy эта функция не затрагивает.
+    Сначала остановите опрос. Без path освобождаются все наши устройства.
+    При завершении Python функция вызывается автоматически через atexit.
+    Даже если освобождение режима Cyb не удаётся, файловые блокировки снимаются.
+    Следующее чтение в этом процессе может захватить устройство снова.
     """
     if path is not None and (not isinstance(path, bytes) or not path):
         raise ValueError("path должен быть непустым bytes либо None")
     with _LOCK:
-        return _release_readers_locked(path)
+        try:
+            cyb_ok = _release_readers_locked(path)
+        finally:
+            locks_ok = _release_reader_locks(path)
+        return cyb_ok and locks_ok
 
 
 def set_persistent_host_control(enabled: bool = True) -> bool:
@@ -339,6 +423,31 @@ def _enumerate(hid) -> tuple[ReaderInfo, ...]:
 def list_readers() -> tuple[ReaderInfo, ...]:
     """Найти поддерживаемые wCopy и Cyb HID-считыватели; без отправки команд."""
     return _enumerate(_get_hid())
+
+
+def reserve_reader(*, path: bytes | None = None) -> bool:
+    """Заранее проверить и зарезервировать считыватель без отправки HID-команд.
+
+    Полезно при запуске приложения, чтобы сразу показать ReaderBusyError,
+    даже если пользователь ещё не открыл меню чтения карты.
+    Как и read_card, требует выбрать path, если найдено несколько устройств.
+    Блокировка удерживается до close_readers() или завершения процесса.
+    """
+    if path is not None and (not isinstance(path, bytes) or not path):
+        raise ValueError("path должен быть непустым bytes из list_readers() либо None")
+    with _LOCK:
+        readers = _enumerate(_get_hid())
+        if path is not None:
+            readers = tuple(reader for reader in readers if reader.path == path)
+        if not readers:
+            raise ReaderNotFoundError(
+                "Поддерживаемый считыватель wCopy / Cyb не найден", stage="enumerate")
+        if len(readers) != 1:
+            raise MultipleReadersError(
+                "Найдено несколько считывателей; задайте path из list_readers()",
+                stage="enumerate")
+        _claim_reader_lock(readers[0].path)
+        return True
 
 
 def _request(payload: bytes, sequence: int) -> bytes:
@@ -846,6 +955,9 @@ def _open_session(path: bytes | None, timeout_ms: int, *, feedback: bool = False
         if len(readers) != 1:
             raise MultipleReadersError("Найдено несколько считывателей; задайте path из list_readers()",
                                        stage="enumerate")
+        # Claim before opening HID: competing versions of our library fail with
+        # ReaderBusyError, without sending even an initialization command.
+        new_lock = _claim_reader_lock(readers[0].path)
         _LAST_READER_PATH = readers[0].path
         state = _PRESENCE.setdefault(readers[0].path, _Presence())
         device = None
@@ -891,16 +1003,22 @@ def _open_session(path: bytes | None, timeout_ms: int, *, feedback: bool = False
             else:
                 raise
         finally:
-            if device is not None:
-                try:
-                    device.close()
-                except OSError as exc:
-                    if quiet:
-                        _LOG.warning("Ошибка закрытия HID после индикации Cyb: %s", exc)
-                    elif primary_error is None:
-                        raise USBError("Ошибка закрытия HID-интерфейса", stage="close") from exc
-                    elif primary_error is not None:
-                        primary_error.add_note(f"Дополнительно не удалось закрыть HID: {exc}")
+            try:
+                if device is not None:
+                    try:
+                        device.close()
+                    except OSError as exc:
+                        if quiet:
+                            _LOG.warning("Ошибка закрытия HID после индикации Cyb: %s", exc)
+                        elif primary_error is None:
+                            raise USBError("Ошибка закрытия HID-интерфейса", stage="close") from exc
+                        else:
+                            primary_error.add_note(f"Дополнительно не удалось закрыть HID: {exc}")
+            finally:
+                # Never keep a newly claimed lock if we could not even enter
+                # the HID session (e.g. device was unplugged during opening).
+                if new_lock and not yielded:
+                    _release_reader_locks(readers[0].path)
 
 
 def read_card_number(*, path: bytes | None = None, timeout_ms: int = 2500,
