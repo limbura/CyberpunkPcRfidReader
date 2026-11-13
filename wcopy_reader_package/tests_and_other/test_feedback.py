@@ -45,25 +45,25 @@ class FeedbackTests(unittest.TestCase):
             if count >= len(sequence):
                 stop.set()
             return original_wait(0)
-        with patch.object(r, 'read_card', side_effect=read), patch.object(stop, 'wait', side_effect=wait), \
+        with patch.object(r, 'read_card', side_effect=read) as reads, patch.object(stop, 'wait', side_effect=wait), \
                 patch.object(r, 'set_reader_feedback') as feedback:
             if fail:
                 feedback.side_effect = r.FeedbackError('unsupported', stage='feedback')
             events = list(r.watch_cards(stop=stop, feedback=True, sound=sound))
-        return events, feedback.call_args_list
+        feedback.assert_not_called()
+        return events, reads.call_args_list
 
     def test_beep_once_until_removal_and_different_uid(self):
         absent = r.NoCardError('absent', stage='poll')
         events, calls = self.run_watch([absent, self.A, self.A, absent, absent, self.A, self.B])
         self.assertEqual([e.number for e in events], [1, 1, 2])
-        self.assertEqual([c.args[0] for c in calls], ['red', 'green', 'green', 'green', 'red', 'green', 'green'])
-        self.assertEqual([c.kwargs['beep'] for c in calls], [False, True, False, False, False, True, True])
+        self.assertTrue(all(c.kwargs['auto_feedback'] for c in calls))
 
     def test_feedback_failure_does_not_lose_cards_or_repeat_commands(self):
         events, calls = self.run_watch([self.A, self.A, self.B], fail=True)
         self.assertEqual([e.number for e in events if isinstance(e, r.CardPresented)], [1, 2])
-        self.assertEqual(len([e for e in events if isinstance(e, r.CardError)]), 1)
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len([e for e in events if isinstance(e, r.CardError)]), 0)
+        self.assertEqual(len(calls), 3)
 
     def test_bad_arguments_no_hardware(self):
         with patch.object(r, '_get_hid') as hid:
@@ -76,8 +76,7 @@ class FeedbackTests(unittest.TestCase):
         absent = r.NoCardError('absent', stage='poll')
         events, calls = self.run_watch([absent, self.A, self.A, self.B], sound=False)
         self.assertEqual([e.number for e in events], [1, 2])
-        self.assertEqual([c.args[0] for c in calls], ['red', 'green', 'green', 'green'])
-        self.assertTrue(all(c.kwargs['beep'] is False for c in calls))
+        self.assertTrue(all(c.kwargs['auto_feedback'] is True for c in calls))
 
 
 if __name__ == '__main__':

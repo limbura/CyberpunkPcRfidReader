@@ -81,7 +81,7 @@ class WriteTests(unittest.TestCase):
     def run_write(self, d, number, **kwargs):
         fake = SimpleNamespace(device=lambda: d, enumerate=lambda *a: [{'path': b'test'}])
         with patch.object(r, '_get_hid', return_value=fake), patch.object(r.time, 'sleep'):
-            return r.write_card_number(number, **kwargs)
+            return r.write_card_number(number, auto_feedback=False, **kwargs)
 
     def test_roundtrip_boundaries_and_preserve_prefix(self):
         old = bytes.fromhex('0102030405060708FFEEDDCCBBAA9988')

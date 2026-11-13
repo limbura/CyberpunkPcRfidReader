@@ -64,7 +64,7 @@ class ReaderTests(unittest.TestCase):
             readers = [{'path': b'test', 'interface_number': 0}]
         fake = SimpleNamespace(device=lambda: device, enumerate=lambda v, p: readers)
         with patch.object(r, '_get_hid', return_value=fake), patch.object(r.time, 'sleep'):
-            return r.read_card_number()
+            return r.read_card_number(auto_feedback=False)
 
     def test_real_log_returns_one_and_exact_commands(self):
         d = FakeDevice()
