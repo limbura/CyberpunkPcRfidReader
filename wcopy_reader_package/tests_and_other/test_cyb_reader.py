@@ -162,6 +162,57 @@ class CybTests(unittest.TestCase):
                 with self.assertRaises(error): self.run_device(d)
                 self.assertTrue(d.closed)
 
+    def test_partial_fast_read_recovers_after_one_or_two_retries(self):
+        for masks in ((1, 3), (2, 1, 3)):
+            with self.subTest(masks=masks):
+                d = Device()
+                actual_write = d.write
+                sequence = iter(masks)
+                bcc = UID[0] ^ UID[1] ^ UID[2] ^ UID[3]
+                manufacturer = UID + bytes([bcc]) + b'\0'*11
+
+                def write(report):
+                    if int.from_bytes(report[2:4], 'big') == 0x6C:
+                        mask = next(sequence)
+                        d.failures[0x6C] = frame(
+                            0x6C, mask.to_bytes(4, 'big') + manufacturer + BLOCK)
+                    return actual_write(report)
+
+                d.write = write
+                with patch.object(r.time, 'sleep') as sleep:
+                    card = self.run_device(d)
+                self.assertEqual(card.number, 513)
+                self.assertEqual(d.reads, len(masks))
+                self.assertEqual(sleep.call_count, len(masks) - 1)
+                sleep.assert_any_call(0.05)
+                self.assertFalse(any(report[3] == 0x69 for report in d.sent))
+
+    def test_partial_fast_read_exhausts_exactly_two_retries(self):
+        for mask in (1, 2):
+            with self.subTest(mask=mask):
+                bcc = UID[0] ^ UID[1] ^ UID[2] ^ UID[3]
+                manufacturer = UID + bytes([bcc]) + b'\0'*11
+                d = Device(failures={0x6C: frame(
+                    0x6C, mask.to_bytes(4, 'big') + manufacturer + BLOCK)})
+                with patch.object(r.time, 'sleep') as sleep:
+                    with self.assertRaises(r.CardReadError) as error:
+                        self.run_device(d)
+                self.assertEqual(error.exception.stage, 'read')
+                self.assertEqual(error.exception.status, mask)
+                self.assertEqual(d.reads, 3)
+                self.assertEqual(sleep.call_count, 2)
+
+    def test_fast_read_does_not_retry_no_card_or_invalid_mask(self):
+        for mask, error_type in ((0, r.NoCardError), (4, r.CardReadError)):
+            with self.subTest(mask=mask):
+                d = Device(failures={0x6C: frame(
+                    0x6C, mask.to_bytes(4, 'big') + bytes(32))})
+                with patch.object(r.time, 'sleep') as sleep:
+                    with self.assertRaises(error_type):
+                        self.run_device(d)
+                self.assertEqual(d.reads, 1)
+                sleep.assert_not_called()
+
     def test_write_preserves_prefix_and_verifies(self):
         d=Device()
         result=self.run_device(d,lambda:r.write_card_number(999,expected_uid=UID,expected_block=BLOCK))
