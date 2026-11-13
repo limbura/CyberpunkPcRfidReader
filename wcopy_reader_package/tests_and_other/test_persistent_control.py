@@ -37,7 +37,7 @@ class PersistentControlTests(unittest.TestCase):
         self.assertEqual(len(self.controls()), 3)
 
     def test_absence_and_errors_do_not_release_or_repeat_write(self):
-        self.device.failures[0x69] = frame(0x69, b'\0'*19)
+        self.device.failures[0x6C] = frame(0x6C, b'\0'*36)
         with self.assertRaises(r.NoCardError): r.read_card()
         self.assertEqual(self.controls(), [b'\1'])
         self.device.failures.clear()
