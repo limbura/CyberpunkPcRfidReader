@@ -229,26 +229,26 @@ def main(argv=None):
                     ref, response = perform(
                         session, secret, label, f"{label}_reference_69",
                         session._poll)
-                    save(ref)
                     if ref["status"] == "error":
+                        save(ref)
                         raise RuntimeError("Контрольный UID через 0x69 не получен")
                     raw_uid, atqa, sak = response
+                    print("  UID через 0x69:    ", raw_uid.hex(" ").upper())
                     if raw_block0 is not None:
-                        result.update(compare_uid(raw_block0, raw_uid, secret))
-                        # Update the in-memory row and rewrite report; CSV adds a separate check row below.
-                        print("  UID через 0x69:    ", raw_uid.hex(" ").upper())
+                        comparison = compare_uid(raw_block0, raw_uid, secret)
+                        ref.update(comparison)
                         print("  UID из блока 0:  ", raw_block0[:len(raw_uid)].hex(" ").upper())
-                        print(f"  Совпадение: {result['uid_match']}; "
-                              f"UID длина={len(raw_uid)}; BCC4={result['bcc4_ok']}")
+                        print(f"  Совпадение: {comparison['uid_match']}; "
+                              f"UID длина={len(raw_uid)}; BCC4={comparison['bcc4_ok']}")
                     else:
+                        comparison = {"uid_match": None, "bcc4_ok": None}
                         print("  Блок 0 не прочитан; сравнение UID невозможно.")
+                    save(ref)
                     check = {
                         "block0_before_69_ok": raw_block0 is not None,
                         "uid_length": len(raw_uid),
-                        "uid_match": (raw_block0[:len(raw_uid)] == raw_uid
-                                      if raw_block0 is not None else None),
-                        "bcc4_ok": (compare_uid(raw_block0, raw_uid, secret)["bcc4_ok"]
-                                    if raw_block0 is not None else None),
+                        "uid_match": comparison["uid_match"],
+                        "bcc4_ok": comparison["bcc4_ok"],
                         "uid_tag": tag(secret, raw_uid),
                         "original_block0_tag": tag(secret, raw_block0) if raw_block0 else None,
                     }
