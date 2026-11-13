@@ -1,6 +1,6 @@
 """Чтение и запись MIFARE Classic: блок 1, ключ A = FF FF FF FF FF FF.
 
-Устройства: wCopy NSR109 / PMX-V624-C и Cyb_Nfctool (аппаратная проверка ожидается).
+Устройства: wCopy NSR109 / PMX-V624-C и Cyb_Nfctool.
 Пример: number = read_card_number()
 Ошибки оборудования/протокола: RFIDError и его подклассы.
 Неверные аргументы API: ValueError. См. README.md и PROTOCOL.md.
@@ -18,7 +18,7 @@ import logging
 import threading
 import time
 
-__version__ = "1.7.1"
+__version__ = "1.8.0"
 VID, PID = 0x2518, 0x6018
 CYB_USB_IDS = ((0x0483, 0x4300), (0x0483, 0x4343))
 BLOCK = 1
@@ -508,8 +508,12 @@ class _Session:
         self.data_exchange(bytes([0x40, 1, 0xA0, BLOCK]) + block,
                            0, "write", CardWriteError)
 
+    def _read_for_write(self) -> CardData:
+        """Internal pre/post-write read; wCopy keeps its unchanged read path."""
+        return self.read()
+
     def write_number(self, encoded: bytes, offset: int, *, expected_uid=None, expected_block=None) -> CardData:
-        before = self.read()
+        before = self._read_for_write()
         if expected_uid is not None and before.uid != expected_uid:
             raise VerificationError("Карта заменена до записи; UID не совпал. Запись не выполнялась.",
                                     stage="prewrite", response=before.uid)
@@ -523,7 +527,7 @@ class _Session:
         try:
             # Новый RF-сеанс, поиск и авторизация: проверяем память карты,
             # а также UID, чтобы не принять другую карту за записанную.
-            after = self.read()
+            after = self._read_for_write()
         except RFIDError as exc:
             raise VerificationError(
                 f"Команда записи выполнена, но обратное чтение не удалось: {exc}",
@@ -678,10 +682,50 @@ class _CybSession(_Session):
     @staticmethod
     def _block_parameters() -> bytes:
         # start block, count, normal access (0), key A, key B.
-        # Both keys are supplied by this protocol; no key-search operation.
+        # Keep the exact single-block packet for writes and their verification.
         return bytes([BLOCK, 1, 0]) + KEY_A + KEY_A
 
+    @staticmethod
+    def _fast_read_parameters() -> bytes:
+        # One native command reads manufacturer block 0 and game-ID block 1.
+        return bytes([0, 2, 0]) + KEY_A + KEY_A
+
     def read(self) -> CardData:
+        """Fast Cyb read: UID and game ID in a single 0x6C(0,2), no 0x69."""
+        self.initialize()
+        body = self.exchange_cyb(0x6C, self._fast_read_parameters(), "read")
+        if len(body) < 4:
+            raise ProtocolError("Нет маски результатов чтения блоков 0 и 1 Cyb",
+                                stage="read", response=body)
+        mask = int.from_bytes(body[:4], "big")
+        # A failed read can also mean wrong keys or an unsupported card;
+        # 0x6C provides no dedicated no-card status. Match polling semantics
+        # for background scanning without changing the public API.
+        if mask == 0 and len(body) in (4, 20, 36):
+            raise NoCardError("Cyb: карта отсутствует или оба блока недоступны",
+                              stage="read", status=mask, response=body)
+        if len(body) != 36:
+            raise ProtocolError("Ожидались маска и 32 байта блоков 0 и 1 Cyb",
+                                stage="read", response=body)
+        if mask != 3:
+            raise CardReadError("Cyb не прочитал оба блока 0 и 1",
+                                stage="read", status=mask, response=body)
+        manufacturer = body[4:20]
+        # The game fleet uses 4-byte UIDs. BCC at byte 4 is the XOR of
+        # UID[0:4]. Fail closed instead of silently interpreting a 7-byte UID
+        # or a non-standard manufacturer block as somebody else's UID.
+        uid = manufacturer[:4]
+        bcc = uid[0] ^ uid[1] ^ uid[2] ^ uid[3]
+        if manufacturer[4] != bcc:
+            raise UnsupportedCardError(
+                "Cyb: блок 0 не подтверждает 4-байтовый UID (BCC неверен)",
+                stage="read", response=manufacturer)
+        # ATQA/SAK come from RF anticollision, not manufacturer memory.
+        # Preserve CardData fields/types, but NEVER invent observed values.
+        return CardData(uid, body[20:36], b"\x00\x00", 0)
+
+    def _read_for_write(self) -> CardData:
+        """Original UID-based Cyb read ONLY for write pre/post verification."""
         self.initialize()
         uid, atqa, sak = self._poll()
         body = self.exchange_cyb(0x6C, self._block_parameters(), "read")
@@ -745,8 +789,13 @@ def read_card(*, path: bytes | None = None, timeout_ms: int = 2500,
     False отключает автоматическую индикацию, но не отслеживание карты.
     По умолчанию Cyb сохраняет управление с ПК между операциями, подавляя
     автономный писк после первого захвата. Завершение — close_readers().
-    Cyb получает UID только перед чтением блока, без повторной проверки после.
-    При смене карты во время чтения UID и данные могут относиться к разным картам.
+    Cyb читает блоки 0 и 1 одной командой 0x6C (без 0x69): из блока 0
+    извлекается 4-байтовый UID с проверкой BCC; блок 1 содержит игровой ID.
+    Поля atqa=b"\\x00\\x00" и sak=0 на быстром Cyb обозначают отсутствие
+    RF-данных, а НЕ измеренные ATQA/SAK. Запись сохраняет прежний метод 0x69.
+    На нестандартных/7-байтовых UID быстрое чтение выдаёт UnsupportedCardError.
+    Результат двух блоков относится к одной команде, но RF-атомарность
+    между блоками прошивкой не гарантирована.
     Сбои индикации журналируются.
     """
     _validate_auto_feedback(auto_feedback)
