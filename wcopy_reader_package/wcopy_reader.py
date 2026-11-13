@@ -425,6 +425,31 @@ def list_readers() -> tuple[ReaderInfo, ...]:
     return _enumerate(_get_hid())
 
 
+def reserve_reader(*, path: bytes | None = None) -> bool:
+    """Заранее проверить и зарезервировать считыватель без отправки HID-команд.
+
+    Полезно при запуске приложения, чтобы сразу показать ReaderBusyError,
+    даже если пользователь ещё не открыл меню чтения карты.
+    Как и read_card, требует выбрать path, если найдено несколько устройств.
+    Блокировка удерживается до close_readers() или завершения процесса.
+    """
+    if path is not None and (not isinstance(path, bytes) or not path):
+        raise ValueError("path должен быть непустым bytes из list_readers() либо None")
+    with _LOCK:
+        readers = _enumerate(_get_hid())
+        if path is not None:
+            readers = tuple(reader for reader in readers if reader.path == path)
+        if not readers:
+            raise ReaderNotFoundError(
+                "Поддерживаемый считыватель wCopy / Cyb не найден", stage="enumerate")
+        if len(readers) != 1:
+            raise MultipleReadersError(
+                "Найдено несколько считывателей; задайте path из list_readers()",
+                stage="enumerate")
+        _claim_reader_lock(readers[0].path)
+        return True
+
+
 def _request(payload: bytes, sequence: int) -> bytes:
     if not 1 <= len(payload) <= 48:
         raise ValueError("Длина команды должна быть 1..48 байтов")
