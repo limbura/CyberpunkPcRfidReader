@@ -201,7 +201,18 @@ def main(argv=None):
 
                 for label in ("A", "B")[:args.cards]:
                     if label == "B":
-                        input("\nУберите A, приложите ДРУГУЮ карту B. Нажмите Enter: ")
+                        input("\nУберите A. Оставьте антенну пустой и нажмите Enter: ")
+                        absent, reply_absent = perform(
+                            session, secret, "none", "no_card_direct_block0",
+                            lambda: read(session, 0, 1), start=0, count=1)
+                        save(absent)
+                        report["checks"]["empty_antenna_read"] = absent["status"]
+                        if absent["status"] == "read_ok":
+                            report.setdefault("warnings", []).append(
+                                "Блок 0 успешно прочитан без карты: возможен устаревший ответ!")
+                        if absent["status"] == "error":
+                            raise RuntimeError("Ошибка обмена при проверке пустой антенны")
+                        input("\nТеперь приложите ДРУГУЮ карту B и нажмите Enter: ")
                     print(f"\nКарта {label}:")
                     raw_block0 = None
                     raw_uid = None
@@ -225,9 +236,10 @@ def main(argv=None):
                     if raw_block0 is not None:
                         result.update(compare_uid(raw_block0, raw_uid, secret))
                         # Update the in-memory row and rewrite report; CSV adds a separate check row below.
-                        print(f"  UID из блока 0 совпадает с 0x69: "
-                              f"{result['uid_match']}; UID длина={len(raw_uid)}; "
-                              f"BCC4={result['bcc4_ok']}")
+                        print("  UID через 0x69:    ", raw_uid.hex(" ").upper())
+                        print("  UID из блока 0:  ", raw_block0[:len(raw_uid)].hex(" ").upper())
+                        print(f"  Совпадение: {result['uid_match']}; "
+                              f"UID длина={len(raw_uid)}; BCC4={result['bcc4_ok']}")
                     else:
                         print("  Блок 0 не прочитан; сравнение UID невозможно.")
                     check = {
@@ -258,6 +270,9 @@ def main(argv=None):
                         parsed2[0] == raw_block0 if parsed2 and raw_block0 else None)
                     print(f"  Совместное чтение 0+1: {combined['status']}, "
                           f"маска={combined['mask']}, UID совпал={check['combined_uid_match']}")
+                    if parsed2 is not None:
+                        print("  UID из совмещённого чтения:",
+                              parsed2[0][:len(raw_uid)].hex(" ").upper())
 
                     block1, reply1 = perform(
                         session, secret, label, f"{label}_direct_block1",
