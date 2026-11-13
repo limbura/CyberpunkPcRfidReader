@@ -25,7 +25,7 @@ class AutoFeedbackTests(unittest.TestCase):
         return [x[6:-2] for x in self.device.sent if x[2:4] == b'\0\x55']
 
     def absent(self):
-        self.device.failures[0x69] = frame(0x69, b'\0'*19)
+        self.device.failures[0x6C] = frame(0x6C, b'\0'*36)
         with self.assertRaises(r.NoCardError):
             r.read_card()
 
