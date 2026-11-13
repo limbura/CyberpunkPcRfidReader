@@ -155,7 +155,7 @@ class CybTests(unittest.TestCase):
             (frame(0x6C,b'\0'*4+BLOCK),r.NoCardError),
             (frame(0x6C,b'\0\0\0\1'),r.ProtocolError),
             (frame(0x6C,b'\0\0\0\1'+bytes(32)),r.CardReadError),
-            (frame(0x6C,b'\0\0\0\3'+bytes(32)),r.UnsupportedCardError),
+            (frame(0x6C,b'\0\0\0\3'+b'\0'*4+b'\x01'+bytes(27)),r.UnsupportedCardError),
         ]:
             with self.subTest(reply=reply):
                 d=Device(failures={0x6C:reply})
