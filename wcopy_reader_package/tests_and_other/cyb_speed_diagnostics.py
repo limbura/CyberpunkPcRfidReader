@@ -114,8 +114,8 @@ def run_mode(profiler, path, mode, condition, count, timeout_ms, interval, save)
             save(row)
             parts = totals(row)
             print(f"  {index}/{count}: {row['status']}, всего {row['total_ms']:.0f} мс; "
-                  f"51={parts.get('initialize', 0):.0f}, поиск={parts.get('poll_1', 0):.0f}, "
-                  f"блок={parts.get('read', 0):.0f} мс")
+                  f"51={parts.get('initialize', 0):.0f}, "
+                  f"чтение={parts.get('read', 0):.0f} мс")
             if row['status'] == 'error':
                 # Do not continue a retained session after a protocol/USB error.
                 print('  Ошибка:', row['code'], row['stage'], row['error'])
